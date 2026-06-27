@@ -12,15 +12,14 @@
 //! that same Engine from a synchronous loop (ultimately a busy-spin ring
 //! pipeline with isolated I/O consumers), keeping openraft's proven algorithm.
 //!
-//! ## Status: v2 — owns the event loop
+//! ## Status: v3 — owns the event loop and all command drains
 //!
-//! `SyncCore` now **owns the `do_main` + `runtime_loop` orchestration** (the
-//! select over shutdown / notifications / API messages, the command-run
-//! ordering, the budget balancer, startup and shutdown-metrics handling). It
-//! still delegates the *per-message handlers* and *command execution* to the
-//! proven `RaftCore` helpers (`handle_notification`, `process_raft_msg`,
-//! `process_notification`, `run_engine_commands`). Those are what the next step
-//! replaces with synchronous, ring-dispatched execution — but the loop is ours.
+//! `SyncCore` now **owns the full orchestration**: `do_main` + `runtime_loop`,
+//! `process_raft_msg`, `process_notification`, `run_engine_commands`, and
+//! `run_progress_driven_command`. It still delegates only the engine-driving
+//! *per-message handlers* (`handle_api_msg`, `handle_notification`) and the
+//! actual I/O executor (`run_command`) to `RaftCore`. Those are what the next
+//! step replaces with synchronous, ring-dispatched execution.
 //!
 //! Validated by running openraft's own integration suite with
 //! `--features sync-core`.
@@ -28,18 +27,21 @@
 use futures_util::FutureExt;
 
 use crate::async_runtime::MpscReceiver;
+use crate::async_runtime::TryRecvError;
 use crate::async_runtime::watch::WatchSender;
 use crate::core::RaftCore;
 use crate::core::ServerState;
 use crate::core::balancer::Balancer;
 use crate::errors::Fatal;
 use crate::errors::Infallible;
-use crate::StorageError;
-use crate::runtime::RaftRuntime;
+use crate::log_id::option_raft_log_id_ext::OptionRaftLogIdExt;
 use crate::network::RaftNetworkFactory;
+use crate::raft_state::LogStateReader;
+use crate::runtime::RaftRuntime;
 use crate::storage::RaftLogStorage;
 use crate::type_config::alias::OneshotReceiverOf;
 use crate::RaftTypeConfig;
+use crate::StorageError;
 
 /// Synchronous alternative to [`RaftCore`]. See module docs.
 pub(crate) struct SyncCore<C, NF, LS, SM>
@@ -136,8 +138,8 @@ where
             self.run_engine_commands().await?;
 
             // Drain channels one by one, bounded by the balancer's budgets.
-            let raft_msg_processed = self.core.process_raft_msg(balancer.raft_msg()).await?;
-            let notify_processed = self.core.process_notification(balancer.notification()).await?;
+            let raft_msg_processed = self.process_raft_msg(balancer.raft_msg()).await?;
+            let notify_processed = self.process_notification(balancer.notification()).await?;
 
             #[allow(clippy::collapsible_else_if)]
             if notify_processed == balancer.notification() {
@@ -151,6 +153,100 @@ where
             self.core.trigger_routine_actions();
             self.run_engine_commands().await?;
         }
+    }
+
+    /// Mirrors `RaftCore::process_raft_msg`: drain the API channel up to
+    /// `at_most` messages, calling `RaftCore::handle_api_msg` per message and
+    /// `SyncCore::run_engine_commands` for the command drain after each batch.
+    async fn process_raft_msg(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
+        self.core.runtime_stats.raft_msg_budget.record(at_most);
+
+        let mut processed = 0u64;
+        let mut total = 0u64;
+        // Being 0 disabled batch msg processing.
+        // TODO: make it configurable
+        let run_command_threshold = 0;
+        let mut last_log_index = 0;
+
+        for _i in 0..at_most {
+            let res = self.core.rx_api.try_recv().await?;
+            let Some(msg) = res else {
+                break;
+            };
+
+            self.core.handle_api_msg(msg).await;
+            processed += 1;
+            total += 1;
+
+            let index = self.core.engine.state.last_log_id().next_index();
+
+            if index.saturating_sub(last_log_index) >= run_command_threshold {
+                // After handling all the inputs, batch run all the commands for better performance
+                self.core.runtime_stats.raft_msg_per_run.record(processed);
+                self.core.runtime_stats.raft_msg_usage_permille.record(processed * 1000 / at_most);
+                self.run_engine_commands().await?;
+
+                last_log_index = index;
+                processed = 0;
+            }
+        }
+
+        // After handling all the inputs, batch run all the commands for better performance
+        self.core.runtime_stats.raft_msg_per_run.record(processed);
+        self.core.runtime_stats.raft_msg_usage_permille.record(processed * 1000 / at_most);
+        self.run_engine_commands().await?;
+
+        if total == at_most {
+            tracing::debug!("at_most({}) reached, there are more queued RaftMsg to process", at_most);
+        }
+
+        Ok(total)
+    }
+
+    /// Mirrors `RaftCore::process_notification`: drain the notification channel
+    /// up to `at_most` messages, calling `RaftCore::handle_notification` per
+    /// message and `SyncCore::run_engine_commands` for the command drain after each.
+    async fn process_notification(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
+        self.core.runtime_stats.notification_budget.record(at_most);
+
+        let mut processed = 0u64;
+
+        for _i in 0..at_most {
+            let res = self.core.rx_notification.try_recv();
+            let notify = match res {
+                Ok(msg) => msg,
+                Err(e) => match e {
+                    TryRecvError::Empty => {
+                        tracing::debug!("all Notification are processed, wait for more");
+                        break;
+                    }
+                    TryRecvError::Disconnected => {
+                        tracing::error!("rx_notify is disconnected, quit");
+                        return Err(Fatal::Stopped);
+                    }
+                },
+            };
+
+            self.core.handle_notification(notify)?;
+            processed += 1;
+
+            // TODO: does run_engine_commands() run too frequently?
+            //       to run many commands in one shot, it is possible to batch more commands to gain
+            //       better performance.
+
+            self.run_engine_commands().await?;
+        }
+
+        self.core.runtime_stats.notification_usage_permille.record(processed * 1000 / at_most);
+
+        if processed == at_most {
+            tracing::debug!(
+                "at_most({}) reached, there are more queued Notification to process",
+                at_most
+            );
+        }
+
+        Ok(processed)
     }
 
     /// Mirrors `RaftCore::run_engine_commands`: drain and execute the Engine's

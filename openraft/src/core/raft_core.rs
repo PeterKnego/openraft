@@ -1290,7 +1290,8 @@ where
     ///
     /// It returns the number of processed message.
     /// If the input channel is closed, it returns `Fatal::Stopped`.
-    pub(crate) async fn process_raft_msg(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
+    #[cfg_attr(feature = "sync-core", allow(dead_code))]
+    async fn process_raft_msg(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
         self.runtime_stats.raft_msg_budget.record(at_most);
 
         let mut processed = 0u64;
@@ -1339,7 +1340,8 @@ where
     ///
     /// It returns the number of processed notifications.
     /// If the input channel is closed, it returns `Fatal::Stopped`.
-    pub(crate) async fn process_notification(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
+    #[cfg_attr(feature = "sync-core", allow(dead_code))]
+    async fn process_notification(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
         self.runtime_stats.notification_budget.record(at_most);
 
         let mut processed = 0u64;
