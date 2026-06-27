@@ -283,6 +283,8 @@ where
     SM: 'static,
 {
     /// The main loop of the Raft protocol.
+    // When `sync-core` is enabled, `SyncCore` owns the loop and these are unused.
+    #[cfg_attr(feature = "sync-core", allow(dead_code))]
     pub(crate) async fn main(mut self, rx_shutdown: OneshotReceiverOf<C, ()>) -> Result<Infallible, Fatal<C>> {
         let span = tracing::span!(parent: &self.span, Level::DEBUG, "main");
         let res = self.do_main(rx_shutdown).instrument(span).await;
@@ -315,6 +317,7 @@ where
 
     #[tracing::instrument(level = "trace", skip_all, fields(id=display(&self.id), cluster=%self.config.cluster_name
     ))]
+    #[cfg_attr(feature = "sync-core", allow(dead_code))]
     async fn do_main(&mut self, rx_shutdown: OneshotReceiverOf<C, ()>) -> Result<Infallible, Fatal<C>> {
         tracing::debug!("raft node is initializing");
 
@@ -1212,6 +1215,7 @@ where
     ///
     /// It always returns a [`Fatal`] error upon returning.
     #[tracing::instrument(level = "debug", skip_all, fields(id=display(&self.id)))]
+    #[cfg_attr(feature = "sync-core", allow(dead_code))]
     async fn runtime_loop(&mut self, mut rx_shutdown: OneshotReceiverOf<C, ()>) -> Result<Infallible, Fatal<C>> {
         // Ratio control the ratio of number of RaftMsg to process to number of Notification to process.
         let mut balancer = Balancer::new(10_000);
@@ -1286,7 +1290,7 @@ where
     ///
     /// It returns the number of processed message.
     /// If the input channel is closed, it returns `Fatal::Stopped`.
-    async fn process_raft_msg(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
+    pub(crate) async fn process_raft_msg(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
         self.runtime_stats.raft_msg_budget.record(at_most);
 
         let mut processed = 0u64;
@@ -1335,7 +1339,7 @@ where
     ///
     /// It returns the number of processed notifications.
     /// If the input channel is closed, it returns `Fatal::Stopped`.
-    async fn process_notification(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
+    pub(crate) async fn process_notification(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
         self.runtime_stats.notification_budget.record(at_most);
 
         let mut processed = 0u64;
