@@ -34,6 +34,8 @@ use crate::core::ServerState;
 use crate::core::balancer::Balancer;
 use crate::errors::Fatal;
 use crate::errors::Infallible;
+use crate::StorageError;
+use crate::runtime::RaftRuntime;
 use crate::network::RaftNetworkFactory;
 use crate::storage::RaftLogStorage;
 use crate::type_config::alias::OneshotReceiverOf;
@@ -92,7 +94,7 @@ where
         tracing::debug!("SyncCore is initializing");
 
         self.core.engine.startup();
-        self.core.run_engine_commands().await?;
+        self.run_engine_commands().await?;
         self.core.flush_metrics();
 
         self.runtime_loop(rx_shutdown).await
@@ -131,7 +133,7 @@ where
                 }
             };
 
-            self.core.run_engine_commands().await?;
+            self.run_engine_commands().await?;
 
             // Drain channels one by one, bounded by the balancer's budgets.
             let raft_msg_processed = self.core.process_raft_msg(balancer.raft_msg()).await?;
@@ -147,7 +149,45 @@ where
             }
 
             self.core.trigger_routine_actions();
-            self.core.run_engine_commands().await?;
+            self.run_engine_commands().await?;
         }
+    }
+
+    /// Mirrors `RaftCore::run_engine_commands`: drain and execute the Engine's
+    /// emitted commands, delegating per-command execution to `RaftCore::run_command`.
+    async fn run_engine_commands(&mut self) -> Result<(), StorageError<C>> {
+        self.core.send_satisfied_responds();
+
+        loop {
+            self.core.engine.output.sched_commands(&self.core.config);
+
+            let Some(cmd) = self.core.engine.output.pop_command() else {
+                break;
+            };
+
+            let res = self.core.run_command(cmd).await?;
+
+            let Some(cmd) = res else {
+                continue;
+            };
+
+            // Command can't run yet; postpone it.
+            if self.core.engine.output.postpone_command(cmd).is_ok() {
+                continue;
+            }
+            break;
+        }
+
+        self.run_progress_driven_command().await?;
+        Ok(())
+    }
+
+    /// Mirrors `RaftCore::run_progress_driven_command`.
+    async fn run_progress_driven_command(&mut self) -> Result<(), StorageError<C>> {
+        while let Some(cmd) = self.core.engine.next_progress_driven_command() {
+            let res = self.core.run_command(cmd).await?;
+            debug_assert!(res.is_none(), "progress driven command should always be executed");
+        }
+        Ok(())
     }
 }
