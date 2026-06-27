@@ -41,9 +41,13 @@ mod replication_state;
 mod server_state;
 mod shared_replicate_batch;
 mod step_down_watcher;
+#[cfg(feature = "sync-core")]
+mod sync_core;
 mod tick;
 
 pub(crate) use client_responder_queue::ClientResponderQueue;
+#[cfg(feature = "sync-core")]
+pub(crate) use sync_core::SyncCore;
 pub use notification_name::NotificationName;
 pub(crate) use raft_core::ApplyResult;
 pub use raft_core::RaftCore;

@@ -575,7 +575,14 @@ where
             &config,
         );
 
+        #[cfg(not(feature = "sync-core"))]
         let core_handle = C::spawn(core.main(rx_shutdown).instrument(trace_span!("spawn").or_current()));
+        #[cfg(feature = "sync-core")]
+        let core_handle = C::spawn(
+            crate::core::SyncCore::new(core)
+                .main(rx_shutdown)
+                .instrument(trace_span!("spawn").or_current()),
+        );
 
         let inner = RaftInner {
             id,

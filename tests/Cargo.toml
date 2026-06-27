@@ -39,5 +39,8 @@ tracing-subscriber = { workspace = true }
 [features]
 
 bt = ["openraft/bt"]
+# Run the whole suite through the experimental synchronous core (SyncCore)
+# instead of RaftCore: cargo test -p tests --features sync-core
+sync-core = ["openraft/sync-core"]
 runtime-stats = ["openraft/runtime-stats"]
 single-term-leader = ["openraft-memstore/single-term-leader"]
