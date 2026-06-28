@@ -32,6 +32,7 @@ use crate::async_runtime::watch::WatchSender;
 use crate::core::RaftCore;
 use crate::core::ServerState;
 use crate::core::balancer::Balancer;
+use crate::engine::Command;
 use crate::errors::Fatal;
 use crate::errors::Infallible;
 use crate::log_id::option_raft_log_id_ext::OptionRaftLogIdExt;
@@ -249,8 +250,37 @@ where
         Ok(processed)
     }
 
+    /// Per-command execution. Phase 3b.1: the task-spawning/network commands are
+    /// delegated to `RaftCore::run_command` (Phase 3c relocates them); the
+    /// storage/apply/pure-sync commands are moved inline in later tasks. For now
+    /// everything delegates — this task just establishes SyncCore as the dispatch
+    /// point.
+    async fn run_command(&mut self, cmd: Command<C, SM>) -> Result<Option<Command<C, SM>>, StorageError<C>> {
+        // Task-spawning / network commands stay RaftCore's for now (Phase 3c).
+        // Use `matches!` (a transient borrow) rather than `match &cmd { .. => return
+        // self.core.run_command(cmd) }` — the latter moves `cmd` while the `&cmd`
+        // scrutinee borrow is still live, which does not compile.
+        let delegate = matches!(
+            &cmd,
+            Command::SendVote { .. }
+                | Command::SendPreVote { .. }
+                | Command::BroadcastHeartbeat { .. }
+                | Command::Replicate { .. }
+                | Command::ReplicateSnapshot { .. }
+                | Command::BroadcastTransferLeader { .. }
+                | Command::CloseReplicationStreams
+                | Command::RebuildReplicationStreams { .. }
+        );
+        if delegate {
+            return self.core.run_command(cmd).await;
+        }
+        // Owned commands (storage / apply / pure-sync) — delegated for now, moved
+        // inline in Tasks 2-3.
+        self.core.run_command(cmd).await
+    }
+
     /// Mirrors `RaftCore::run_engine_commands`: drain and execute the Engine's
-    /// emitted commands, delegating per-command execution to `RaftCore::run_command`.
+    /// emitted commands, delegating per-command execution to `SyncCore::run_command`.
     async fn run_engine_commands(&mut self) -> Result<(), StorageError<C>> {
         self.core.send_satisfied_responds();
 
@@ -261,7 +291,7 @@ where
                 break;
             };
 
-            let res = self.core.run_command(cmd).await?;
+            let res = self.run_command(cmd).await?;
 
             let Some(cmd) = res else {
                 continue;
@@ -281,7 +311,7 @@ where
     /// Mirrors `RaftCore::run_progress_driven_command`.
     async fn run_progress_driven_command(&mut self) -> Result<(), StorageError<C>> {
         while let Some(cmd) = self.core.engine.next_progress_driven_command() {
-            let res = self.core.run_command(cmd).await?;
+            let res = self.run_command(cmd).await?;
             debug_assert!(res.is_none(), "progress driven command should always be executed");
         }
         Ok(())
