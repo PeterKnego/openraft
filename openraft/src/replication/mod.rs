@@ -63,6 +63,13 @@ use crate::type_config::alias::MutexOf;
 use crate::type_config::async_runtime::mpsc::MpscSender;
 use crate::vote::RaftVote;
 
+/// The log-reader type held by a replication stream. Under `sync-core` the durability
+/// consumer vends a readability-gated reader; otherwise it is the storage's own reader.
+#[cfg(not(feature = "sync-core"))]
+pub(crate) type ReplLogReader<C, LS> = <LS as RaftLogStorage<C>>::LogReader;
+#[cfg(feature = "sync-core")]
+pub(crate) type ReplLogReader<C, LS> = crate::core::VendedReader<C, LS>;
+
 /// A task responsible for sending replication events to a target follower in the Raft cluster.
 ///
 /// NOTE: we do not stack replication requests to targets because this could result in
@@ -120,7 +127,7 @@ where
         replication_context: ReplicationContext<C>,
         progress: ReplicationProgress<C>,
         network: N::Network,
-        log_reader: LS::LogReader,
+        log_reader: ReplLogReader<C, LS>,
         event_watcher: EventWatcher<C>,
         span: tracing::Span,
     ) -> JoinHandleOf<C, Result<(), ReplicationClosed>> {

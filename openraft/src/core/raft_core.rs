@@ -205,7 +205,7 @@ where
     /// channel requests a fresh `LogReader` from the consumer, which replies on the oneshot.
     #[cfg(feature = "sync-core")]
     pub(crate) log_reader_request_tx:
-        std::sync::mpsc::Sender<crate::type_config::alias::OneshotSenderOf<C, LS::LogReader>>,
+        std::sync::mpsc::Sender<crate::type_config::alias::OneshotSenderOf<C, crate::core::VendedReader<C, LS>>>,
 
     /// A controlling handle to the [`RaftStateMachine`] worker.
     ///

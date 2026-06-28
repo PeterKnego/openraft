@@ -22,7 +22,10 @@
 //! This module is feature-gated (`sync-core`). The reactor-free `block_on` graduates
 //! here from `sync_durability_spike.rs` (which is deleted once it is no longer used).
 
+use std::fmt::Debug;
 use std::future::Future;
+use std::ops::Bound;
+use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -44,14 +47,21 @@ use disruptor::build_single_producer;
 
 use crate::RaftTypeConfig;
 use crate::StorageError;
+use crate::async_runtime::WatchSender;
+use crate::async_runtime::watch::WatchReceiver;
+use crate::base::OptionalSend;
 use crate::errors::StorageIOResult;
 use crate::raft_state::io_state::io_id::IOId;
 use crate::storage::IOFlushed;
+use crate::storage::RaftLogReader;
 use crate::storage::RaftLogStorage;
+use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::BatchOf;
+use crate::type_config::alias::EntryOf;
 use crate::type_config::alias::LogIdOf;
 use crate::type_config::alias::OneshotSenderOf;
 use crate::type_config::alias::VoteOf;
+use crate::type_config::alias::WatchReceiverOf;
 use crate::type_config::alias::WatchSenderOf;
 use crate::type_config::async_runtime::oneshot::OneshotSender;
 
@@ -94,8 +104,82 @@ fn noop_waker() -> Waker {
 /// The completion channel payload for the four await-completion write ops.
 type Done<C> = OneshotSenderOf<C, Result<(), StorageError<C>>>;
 
-/// A reader request: the consumer fulfils it by sending a fresh `LogReader` back.
-pub(crate) type ReaderRequest<C, LS> = OneshotSenderOf<C, <LS as RaftLogStorage<C>>::LogReader>;
+/// A reader request: the consumer fulfils it by sending a fresh **gated** reader back.
+pub(crate) type ReaderRequest<C, LS> = OneshotSenderOf<C, VendedReader<C, LS>>;
+
+/// The reader type vended to the (delegated) replication path: the storage's own reader
+/// wrapped in the readability gate.
+pub(crate) type VendedReader<C, LS> = GatedLogReader<C, <LS as RaftLogStorage<C>>::LogReader>;
+
+/// Wraps a `RaftLogStorage::LogReader` with a readability gate. Because append is
+/// fire-and-forget onto the durability consumer, an entry may be "submitted" on the
+/// consensus loop before the consumer has actually `append`ed it. The
+/// `RaftLogStorage::append` contract requires appended entries to be readable the moment
+/// `append` returns, so a reader on another thread must not short-read an entry that is
+/// in-flight. This wrapper blocks each read until the consumer's `readable` watermark
+/// (highest log index currently in the store) covers the requested range, then delegates.
+pub(crate) struct GatedLogReader<C, R>
+where
+    C: RaftTypeConfig,
+    R: RaftLogReader<C>,
+{
+    inner: R,
+    /// Highest readable log index currently in the store (`None` = nothing readable). Updated
+    /// by the consumer in FIFO op order, so it tracks truncation (it can decrease).
+    readable: WatchReceiverOf<C, Option<u64>>,
+}
+
+impl<C, R> GatedLogReader<C, R>
+where
+    C: RaftTypeConfig,
+    R: RaftLogReader<C>,
+{
+    pub(crate) fn new(inner: R, readable: WatchReceiverOf<C, Option<u64>>) -> Self {
+        Self { inner, readable }
+    }
+
+    /// Block until the watermark covers `hi` (the highest index the read needs). Best-effort:
+    /// if the watch sender is gone (consumer shut down) we proceed and let the inner read
+    /// reflect final state. Only the END of the range is gated — absence at the start
+    /// (purged entries) is a tolerated short read per the reader contract.
+    async fn await_readable(&mut self, hi: Option<u64>) {
+        if let Some(hi) = hi {
+            let _ = self.readable.wait_until_ge(&Some(hi)).await;
+        }
+    }
+}
+
+/// Compute the highest index a range needs, or `None` for an empty/unbounded-end range.
+fn range_hi<RB: RangeBounds<u64>>(range: &RB) -> Option<u64> {
+    match range.end_bound() {
+        Bound::Included(&e) => Some(e),
+        Bound::Excluded(&e) => e.checked_sub(1),
+        Bound::Unbounded => None,
+    }
+}
+
+impl<C, R> RaftLogReader<C> for GatedLogReader<C, R>
+where
+    C: RaftTypeConfig,
+    R: RaftLogReader<C>,
+{
+    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<EntryOf<C>>, std::io::Error> {
+        self.await_readable(range_hi(&range)).await;
+        self.inner.try_get_log_entries(range).await
+    }
+
+    async fn limited_get_log_entries(&mut self, start: u64, end: u64) -> Result<Vec<EntryOf<C>>, std::io::Error> {
+        self.await_readable(end.checked_sub(1)).await;
+        self.inner.limited_get_log_entries(start, end).await
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, std::io::Error> {
+        self.inner.read_vote().await
+    }
+}
 
 /// One storage write op routed to the consumer.
 ///
@@ -196,7 +280,13 @@ where
     let (poller, builder) = build_single_producer(1024, factory, BusySpin).new_event_poller();
     let producer = builder.build();
 
-    let join = std::thread::spawn(move || consumer_loop::<C, LS>(log_store, poller, reader_rx));
+    // Readable watermark: highest log index currently in the store. Vended readers gate on it.
+    // The consumer keeps `readable_rx0` alive so that `send()` never silently drops updates
+    // before the first `subscribe()` is called: tokio watch's `send()` discards the value if
+    // all receivers have been dropped.
+    let (readable_tx, readable_rx0) = C::watch_channel::<Option<u64>>(None);
+
+    let join = std::thread::spawn(move || consumer_loop::<C, LS>(log_store, poller, reader_rx, readable_tx, readable_rx0));
 
     LogStoreHandle {
         producer: Some(producer),
@@ -206,21 +296,36 @@ where
 
 /// The reactor-free consumer loop. Owns `log_store`; services reader requests then the
 /// write ring each iteration; exits on `Polling::Shutdown` (producer dropped).
+///
+/// `readable_rx0` is the initial receiver kept alive so that `send()` never silently
+/// discards watermark updates before the first `subscribe()` call.
 fn consumer_loop<C, LS>(
     mut log_store: LS,
     mut poller: EventPoller<DurabilityEvent<C>, SingleProducerBarrier>,
     reader_rx: mpsc::Receiver<ReaderRequest<C, LS>>,
+    readable_tx: WatchSenderOf<C, Option<u64>>,
+    _readable_rx0: WatchReceiverOf<C, Option<u64>>,
 ) where
     C: RaftTypeConfig,
     LS: RaftLogStorage<C>,
 {
+    // Initialise the watermark from any entries already on disk (e.g. a node restarting
+    // with an existing log). Without this, the gate would block replication streams trying
+    // to read entries that are already readable in storage, even though no Append op has
+    // gone through the consumer yet.
+    let init = block_on(log_store.get_log_state())
+        .ok()
+        .and_then(|s| s.last_log_id)
+        .map(|l| l.index());
+    readable_tx.send(init).ok();
+
     loop {
-        // (a) Vend readers (rare — per replication-stream rebuild). Drain all pending.
+        // (a) Vend gated readers (rare — per replication-stream rebuild). Drain all pending.
         loop {
             match reader_rx.try_recv() {
                 Ok(done) => {
                     let reader = block_on(log_store.get_log_reader());
-                    done.send(reader).ok();
+                    done.send(GatedLogReader::new(reader, readable_tx.subscribe())).ok();
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 // Senders gone: stop vending; ring shutdown drives the actual exit.
@@ -235,7 +340,7 @@ fn consumer_loop<C, LS>(
                 for event in &mut events {
                     let taken = event.op.lock().unwrap().take();
                     if let Some(op) = taken {
-                        run_op(&mut log_store, op);
+                        run_op(&mut log_store, op, &readable_tx);
                         did_work = true;
                     }
                 }
@@ -254,7 +359,8 @@ fn consumer_loop<C, LS>(
 }
 
 /// Execute one write op against the (consumer-owned) `log_store`, reactor-free.
-fn run_op<C, LS>(log_store: &mut LS, op: DurabilityOp<C>)
+/// Updates `readable_tx` after `Append` and `Truncate` so gated readers know the new watermark.
+fn run_op<C, LS>(log_store: &mut LS, op: DurabilityOp<C>, readable_tx: &WatchSenderOf<C, Option<u64>>)
 where
     C: RaftTypeConfig,
     LS: RaftLogStorage<C>,
@@ -266,6 +372,8 @@ where
             tx_io_completed,
             done,
         } => {
+            // Extract the last index BEFORE moving io_id into the callback.
+            let last_idx = io_id.last_log_id().map(|l| l.index());
             let callback = IOFlushed::new(io_id, tx_io_completed);
             // `append` returns at *submitted/readable* (per the `RaftLogStorage::append`
             // contract); the `callback` drives the later *flush* completion, unchanged.
@@ -274,6 +382,10 @@ where
             // `?` goes Fatal (matching the original `append(..).await.sto_write_logs()?`),
             // and the un-fired callback is simply dropped, as before.
             let res = block_on(log_store.append(entries, callback)).sto_write_logs();
+            // FIFO consumer order ⇒ this is the current store high-water for appends.
+            if res.is_ok() && let Some(idx) = last_idx {
+                readable_tx.send(Some(idx)).ok();
+            }
             done.send(res).ok();
         }
         DurabilityOp::SaveVote { vote, done } => {
@@ -285,7 +397,11 @@ where
             done.send(res).ok();
         }
         DurabilityOp::Truncate { after, done } => {
-            let res = block_on(log_store.truncate_after(after)).sto_write_logs();
+            let res = block_on(log_store.truncate_after(after.clone())).sto_write_logs();
+            if res.is_ok() {
+                // Suffix removed ⇒ the high-water drops to the truncation point.
+                readable_tx.send(after.map(|l| l.index())).ok();
+            }
             done.send(res).ok();
         }
         DurabilityOp::SaveCommitted { committed, done } => {
@@ -304,7 +420,71 @@ mod tests {
     use disruptor::Producer;
     use disruptor::build_single_producer;
 
+    use super::GatedLogReader;
     use super::block_on;
+
+    /// Drives a `GatedLogReader` with the no-op-waker `block_on` and a side thread that
+    /// advances the watermark. Asserts the inner read does NOT happen until the watermark
+    /// reaches the requested range's high index.
+    #[test]
+    fn gated_reader_blocks_until_watermark_covers_range() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        use crate::RaftLogReader;
+        use crate::async_runtime::WatchSender as _;
+        use crate::engine::testing::UTConfig;
+        use crate::type_config::TypeConfigExt as _;
+
+        // UTConfig is generic (UTConfig<N = ()>); be explicit to avoid type-inference ambiguity.
+        type TC = UTConfig<()>;
+        let (tx, rx) = TC::watch_channel::<Option<u64>>(None);
+
+        // Stub inner reader: records the highest index requested; returns empty.
+        #[derive(Clone)]
+        struct Stub(Arc<AtomicU64>);
+        impl RaftLogReader<TC> for Stub {
+            async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + crate::base::OptionalSend>(
+                &mut self,
+                range: RB,
+            ) -> Result<Vec<crate::type_config::alias::EntryOf<TC>>, std::io::Error> {
+                let end = match range.end_bound() {
+                    std::ops::Bound::Included(&e) => e,
+                    std::ops::Bound::Excluded(&e) => e.saturating_sub(1),
+                    std::ops::Bound::Unbounded => u64::MAX,
+                };
+                self.0.store(end, Ordering::SeqCst);
+                Ok(vec![])
+            }
+
+            async fn read_vote(
+                &mut self,
+            ) -> Result<Option<crate::type_config::alias::VoteOf<TC>>, std::io::Error> {
+                Ok(None)
+            }
+        }
+
+        let observed = Arc::new(AtomicU64::new(0));
+        let mut reader = GatedLogReader::new(Stub(observed.clone()), rx);
+
+        // Advance the watermark from another thread after a short spin, then the read should unblock.
+        let advancer = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                std::hint::spin_loop();
+            }
+            tx.send(Some(5)).ok();
+            // Keep tx alive until the reader has observed the value.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(tx);
+        });
+
+        // block_on drives the gated read; it must wait for watermark>=5 (range 0..6 -> hi=5).
+        let res = block_on(reader.try_get_log_entries(0u64..6u64));
+        assert!(res.is_ok());
+        assert_eq!(observed.load(Ordering::SeqCst), 5, "inner read happened only after the gate opened");
+        advancer.join().unwrap();
+    }
 
     /// Mirrors the real consumer's two-input loop shape (a fake write op + a reader
     /// round-trip with a stub store), using the *real* graduated `block_on`. The generic

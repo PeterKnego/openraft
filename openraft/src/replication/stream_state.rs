@@ -43,7 +43,7 @@ where
     pub(crate) event_watcher: EventWatcher<C>,
 
     /// The [`RaftLogStorage::LogReader`] interface.
-    pub(crate) log_reader: LS::LogReader,
+    pub(crate) log_reader: super::ReplLogReader<C, LS>,
 
     /// The range of log entries to replicate: `(prev_log_id, last_log_id]`.
     ///
