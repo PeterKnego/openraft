@@ -12,10 +12,24 @@
 //! that same Engine from a synchronous loop (ultimately a busy-spin ring
 //! pipeline with isolated I/O consumers), keeping openraft's proven algorithm.
 //!
-//! ## Status: v4 — owns command execution for all storage/apply/pure-sync commands
+//! ## Status: v5 — synchronous consensus loop on a dedicated thread (minimal "3d")
 //!
-//! `SyncCore` now **owns the full orchestration and command execution**.
-//! Methods owned: `do_main`, `runtime_loop`, `process_raft_msg`,
+//! `SyncCore` now runs its event loop **synchronously on a dedicated `std::thread`**,
+//! off the tokio scheduler. `Raft::new` spawns that thread (entering the tokio runtime
+//! *context* — the "hybrid reactor" — so the still-delegated replication commands'
+//! `C::spawn` and the network/IO it drives keep a runtime to run on), and the loop:
+//!  - drains inputs with `try_recv` (`process_raft_msg`/`process_notification`) and polls
+//!    the shutdown oneshot non-blockingly — no async `select!`;
+//!  - drives the async storage/apply/network trait seam to completion with the
+//!    reactor-free, never-park [`block_on`](crate::core::sync_durability::block_on).
+//!
+//! This is the minimal foundation: the loop is off the scheduler, but I/O *completions*
+//! still busy-spin the consensus thread (every `block_on`), partly re-serializing what
+//! 3b.2 moved off-thread. The follow-up completion-as-notification redesign feeds I/O
+//! completions back as later loop inputs to remove that.
+//!
+//! `SyncCore` **owns the full orchestration and command execution**.
+//! Methods owned: `run`, `do_main`, `runtime_loop`, `process_raft_msg`,
 //! `process_notification`, `run_engine_commands`, `run_progress_driven_command`,
 //! and `run_command`.
 //!
@@ -32,8 +46,6 @@
 //! Validated by running openraft's own integration suite with
 //! `--features sync-core`.
 
-use futures_util::FutureExt;
-
 use crate::async_runtime::MpscReceiver;
 use crate::async_runtime::TryRecvError;
 use crate::async_runtime::watch::WatchSender;
@@ -42,6 +54,7 @@ use crate::core::RaftCore;
 use crate::core::ServerState;
 use crate::core::balancer::Balancer;
 use crate::core::sync_durability;
+use crate::core::sync_durability::block_on;
 use crate::core::sync_durability::DurabilityOp;
 use crate::core::sync_durability::LogStoreHandle;
 use crate::core::sync_durability::ReaderRequest;
@@ -114,10 +127,11 @@ where
         }
     }
 
-    /// Entry point. Mirrors `RaftCore::main`: run `do_main`, then flush metrics
-    /// and publish the shutdown state.
-    pub(crate) async fn main(mut self, rx_shutdown: OneshotReceiverOf<C, ()>) -> Result<Infallible, Fatal<C>> {
-        let res = self.do_main(rx_shutdown).await;
+    /// Synchronous entry point, run on the dedicated consensus `std::thread` (see
+    /// `Raft::new`). Mirrors `RaftCore::main`: run `do_main`, then flush metrics and
+    /// publish the shutdown state.
+    pub(crate) fn run(mut self, rx_shutdown: OneshotReceiverOf<C, ()>) -> Result<Infallible, Fatal<C>> {
+        let res = self.do_main(rx_shutdown);
 
         // Flush buffered metrics.
         self.core.flush_metrics();
@@ -126,7 +140,7 @@ where
         let err = res.unwrap_err();
         match err {
             Fatal::Stopped => { /* Normal quit */ }
-            _ => tracing::error!("SyncCore::main error: {}", err),
+            _ => tracing::error!("SyncCore::run error: {}", err),
         }
 
         {
@@ -141,55 +155,47 @@ where
     }
 
     /// Mirrors `RaftCore::do_main`: startup the Engine, drain its startup
-    /// commands, then enter the runtime loop.
-    async fn do_main(&mut self, rx_shutdown: OneshotReceiverOf<C, ()>) -> Result<Infallible, Fatal<C>> {
+    /// commands, then enter the synchronous runtime loop. Startup commands are driven
+    /// reactor-free via [`block_on`].
+    fn do_main(&mut self, rx_shutdown: OneshotReceiverOf<C, ()>) -> Result<Infallible, Fatal<C>> {
         tracing::debug!("SyncCore is initializing");
 
         self.core.engine.startup();
-        self.run_engine_commands().await?;
+        block_on(self.run_engine_commands())?;
         self.core.flush_metrics();
 
-        self.runtime_loop(rx_shutdown).await
+        self.runtime_loop(rx_shutdown)
     }
 
-    /// The event loop. This is the orchestration `SyncCore` owns — the next step
-    /// replaces the async `select`/command execution with a synchronous ring
-    /// pipeline. Today it mirrors `RaftCore::runtime_loop`, delegating the
-    /// per-message handlers and command execution to the proven `RaftCore`
-    /// helpers.
-    async fn runtime_loop(&mut self, mut rx_shutdown: OneshotReceiverOf<C, ()>) -> Result<Infallible, Fatal<C>> {
+    /// The synchronous event loop — the orchestration `SyncCore` owns. Replaces the async
+    /// `select!` with `try_recv` input draining + a non-blocking shutdown poll, and drives
+    /// the async helpers (which still touch the async storage/network trait seam) to
+    /// completion with the reactor-free, never-park [`block_on`]. Busy-spins; yields when a
+    /// whole iteration processed nothing so the suite's many nodes don't peg every core.
+    ///
+    /// This is the minimal "3d": off the scheduler, but I/O completions still busy-spin the
+    /// thread inside `block_on`. The completion-as-notification redesign removes that by
+    /// feeding completions back as later loop inputs.
+    fn runtime_loop(&mut self, rx_shutdown: OneshotReceiverOf<C, ()>) -> Result<Infallible, Fatal<C>> {
         let mut balancer = Balancer::new(10_000);
+        let mut rx_shutdown = std::pin::pin!(rx_shutdown);
 
         loop {
             self.core.flush_metrics();
 
-            // Block until any channel has a message; check shutdown first.
-            futures_util::select_biased! {
-                _ = (&mut rx_shutdown).fuse() => {
-                    tracing::info!("recv from rx_shutdown");
-                    return Err(Fatal::Stopped);
-                }
+            // Shutdown check: non-blocking poll of the oneshot. Ready means either the
+            // signal arrived or the sender was dropped — both mean stop.
+            if sync_durability::poll_once(rx_shutdown.as_mut()).is_ready() {
+                tracing::info!("recv from rx_shutdown");
+                return Err(Fatal::Stopped);
+            }
 
-                notify_res = self.core.rx_notification.recv().fuse() => {
-                    match notify_res {
-                        Some(notify) => self.core.handle_notification(notify)?,
-                        None => {
-                            tracing::error!("all rx_notify senders are dropped");
-                            return Err(Fatal::Stopped);
-                        }
-                    };
-                }
+            block_on(self.run_engine_commands())?;
 
-                msg_res = self.core.rx_api.ensure_buffered().fuse() => {
-                    msg_res?;
-                }
-            };
-
-            self.run_engine_commands().await?;
-
-            // Drain channels one by one, bounded by the balancer's budgets.
-            let raft_msg_processed = self.process_raft_msg(balancer.raft_msg()).await?;
-            let notify_processed = self.process_notification(balancer.notification()).await?;
+            // Drain channels one by one, bounded by the balancer's budgets. Both helpers
+            // are non-blocking (`try_recv` internally) and return how many they processed.
+            let raft_msg_processed = block_on(self.process_raft_msg(balancer.raft_msg()))?;
+            let notify_processed = block_on(self.process_notification(balancer.notification()))?;
 
             #[allow(clippy::collapsible_else_if)]
             if notify_processed == balancer.notification() {
@@ -201,7 +207,13 @@ where
             }
 
             self.core.trigger_routine_actions();
-            self.run_engine_commands().await?;
+            block_on(self.run_engine_commands())?;
+
+            // Reactor-free idle backoff: a fully idle iteration yields rather than pegging
+            // the core (the durability consumer does the same). Latency tuning is later.
+            if raft_msg_processed == 0 && notify_processed == 0 {
+                std::thread::yield_now();
+            }
         }
     }
 

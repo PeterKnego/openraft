@@ -29,6 +29,10 @@ clap            = { workspace = true, optional = true }
 derive_more     = { workspace = true }
 disruptor       = { version = "4.3", optional = true }
 display-more    = { workspace = true }
+# `sync-core` only: the synchronous consensus thread enters the current tokio runtime
+# *context* (hybrid reactor) so delegated replication's `C::spawn` + the network IO it
+# drives have a runtime to run on. `rt` provides `tokio::runtime::Handle`.
+tokio           = { version = "1.39", default-features = false, features = ["rt"], optional = true }
 futures-util    = { workspace = true }
 itertools       = { workspace = true }
 maplit          = { workspace = true }
@@ -59,7 +63,7 @@ tokio-rt = ["dep:openraft-rt-tokio"]
 # Experimental: drive the Raft `Engine` from a synchronous core (`SyncCore`)
 # instead of the async `RaftCore`. Validates a disruptor-style execution harness
 # while reusing openraft's own test suite. `Raft::new` builds SyncCore when set.
-sync-core = ["dep:disruptor"]
+sync-core = ["dep:disruptor", "dep:tokio"]
 
 # Enable building `Config` from command-line arguments via `Config::build`.
 #

@@ -23,6 +23,7 @@
 //! here from `sync_durability_spike.rs` (which is deleted once it is no longer used).
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::task::Context;
@@ -68,6 +69,16 @@ pub(crate) fn block_on<F: Future>(fut: F) -> F::Output {
             Poll::Pending => std::hint::spin_loop(),
         }
     }
+}
+
+/// Non-blocking single poll of a future with the reactor-free no-op waker. Returns
+/// `Poll::Ready(_)` if the future has already completed, `Poll::Pending` otherwise — it
+/// never spins. The synchronous consensus loop uses this to check the shutdown oneshot
+/// each iteration without blocking on it.
+pub(crate) fn poll_once<F: Future>(mut fut: Pin<&mut F>) -> Poll<F::Output> {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    fut.as_mut().poll(&mut cx)
 }
 
 const NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);

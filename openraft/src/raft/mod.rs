@@ -57,8 +57,10 @@ pub use message::WriteResponse;
 pub use message::WriteResult;
 use openraft_macros::since;
 pub use stream_append::StreamAppendResult;
+#[cfg(not(feature = "sync-core"))]
 use tracing::Instrument;
 use tracing::Level;
+#[cfg(not(feature = "sync-core"))]
 use tracing::trace_span;
 
 pub use self::leader::Leader;
@@ -590,11 +592,37 @@ where
         #[cfg(not(feature = "sync-core"))]
         let core_handle = C::spawn(core.main(rx_shutdown).instrument(trace_span!("spawn").or_current()));
         #[cfg(feature = "sync-core")]
-        let core_handle = C::spawn(
-            crate::core::SyncCore::new(core, log_reader_request_rx)
-                .main(rx_shutdown)
-                .instrument(trace_span!("spawn").or_current()),
-        );
+        let core_handle = {
+            // Run the synchronous consensus loop on a dedicated OS thread — off the tokio
+            // scheduler (never parks; busy-spins / yields when idle). We still enter the
+            // current tokio runtime *context* on that thread (the "hybrid reactor"): the
+            // still-delegated replication commands call `C::spawn` and the network/IO they
+            // drive need a runtime to run on. The thread reports its terminal result over a
+            // oneshot; a thin tokio task awaits it so `CoreState::Running` keeps its expected
+            // `C::JoinHandle` type.
+            let sync_core = crate::core::SyncCore::new(core, log_reader_request_rx);
+            let rt_handle = tokio::runtime::Handle::current();
+            let (tx_done, rx_done) = C::oneshot();
+            std::thread::Builder::new()
+                .name("openraft-sync-core".to_string())
+                .spawn(move || {
+                    let _enter = rt_handle.enter();
+                    // Catch a panic in the loop and surface it as `Fatal::Panicked`, matching
+                    // the tokio-task path (where `join_core_task` maps a `JoinError` panic to
+                    // `Fatal::Panicked`). A plain dropped oneshot — the `Err` branch below —
+                    // stays `Fatal::Stopped`.
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sync_core.run(rx_shutdown)));
+                    let res = res.unwrap_or(Err(Fatal::Panicked));
+                    let _ = tx_done.send(res);
+                })
+                .expect("failed to spawn openraft sync-core consensus thread");
+            C::spawn(async move {
+                match rx_done.await {
+                    Ok(res) => res,
+                    Err(_) => Err(Fatal::Stopped),
+                }
+            })
+        };
 
         let inner = RaftInner {
             id,
