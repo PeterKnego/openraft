@@ -14,38 +14,9 @@
 //! This module is feature-gated scaffolding; it is deleted once Phase 3b.2's real
 //! durability consumer lands. The `block_on` helper graduates into the runtime.
 
-use std::future::Future;
-use std::task::Context;
-use std::task::Poll;
-use std::task::RawWaker;
-use std::task::RawWakerVTable;
-use std::task::Waker;
-
-/// Reactor-free `block_on`: drive `fut` to completion by polling with a no-op
-/// waker, never parking. For futures that complete via synchronous operations
-/// (as reactor-free storage/network impls do) the first poll returns `Ready`;
-/// a `Pending` simply re-polls (busy-spin), so no runtime/reactor is needed.
-pub(crate) fn block_on<F: Future>(fut: F) -> F::Output {
-    let mut fut = Box::pin(fut);
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => std::hint::spin_loop(),
-        }
-    }
-}
-
-const NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
-fn noop_clone(_: *const ()) -> RawWaker {
-    RawWaker::new(std::ptr::null(), &NOOP_VTABLE)
-}
-fn noop(_: *const ()) {}
-fn noop_waker() -> Waker {
-    // SAFETY: all vtable fns are no-ops over a null data pointer.
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) }
-}
+// The reactor-free `block_on` has graduated to `super::sync_durability::block_on`
+// (3b.2 Task 1). This spike module is retained only as historical scaffolding and is
+// deleted in 3b.2 Task 4; its test now exercises the graduated `block_on`.
 
 #[cfg(test)]
 mod tests {
@@ -56,7 +27,7 @@ mod tests {
     use disruptor::Producer;
     use disruptor::build_single_producer;
 
-    use super::block_on;
+    use crate::core::sync_durability::block_on;
 
     /// One durability op: a value to "persist" + a channel to report completion.
     /// Stands in for `(entries, IOFlushed callback)` in the real consumer.

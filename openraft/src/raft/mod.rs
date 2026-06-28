@@ -518,13 +518,25 @@ where
 
         let shared_replicate_batch = SharedReplicateBatch::new();
 
+        // Reader-request channel for the `sync-core` durability consumer: the consumer
+        // becomes the sole owner of `log_store`, so the consensus side requests log readers
+        // from it. The `Receiver` is handed to `SyncCore::new`; the `Sender` lives on
+        // `RaftCore`. (No-op when the feature is off.)
+        #[cfg(feature = "sync-core")]
+        let (log_reader_request_tx, log_reader_request_rx) = std::sync::mpsc::channel();
+
         let core: RaftCore<C, N, LS, SM> = RaftCore {
             id: id.clone(),
             config: config.clone(),
             runtime_config: runtime_config.clone(),
             core_state: Default::default(),
             network_factory: network,
+            #[cfg(not(feature = "sync-core"))]
             log_store,
+            #[cfg(feature = "sync-core")]
+            log_store: Some(log_store),
+            #[cfg(feature = "sync-core")]
+            log_reader_request_tx,
             sm_handle,
 
             engine,
@@ -579,7 +591,7 @@ where
         let core_handle = C::spawn(core.main(rx_shutdown).instrument(trace_span!("spawn").or_current()));
         #[cfg(feature = "sync-core")]
         let core_handle = C::spawn(
-            crate::core::SyncCore::new(core)
+            crate::core::SyncCore::new(core, log_reader_request_rx)
                 .main(rx_shutdown)
                 .instrument(trace_span!("spawn").or_current()),
         );

@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use display_more::DisplayOptionExt;
+#[cfg(not(feature = "sync-core"))]
 use display_more::DisplaySliceExt;
 use futures_util::FutureExt;
 use futures_util::StreamExt;
@@ -55,6 +56,7 @@ use crate::engine::Respond;
 use crate::engine::TargetProgress;
 use crate::engine::handler::leader_handler::LeaderHandler;
 use crate::engine::leader_log_ids::LeaderLogIds;
+#[cfg(not(feature = "sync-core"))]
 use crate::entry::RaftEntry;
 use crate::entry::payload::EntryPayload;
 use crate::errors::AllowNextRevertError;
@@ -66,6 +68,7 @@ use crate::errors::InitializeError;
 use crate::errors::NetworkError;
 use crate::errors::QuorumNotEnough;
 use crate::errors::RPCError;
+#[cfg(not(feature = "sync-core"))]
 use crate::errors::StorageIOResult;
 use crate::errors::Timeout;
 use crate::impls::ProgressResponder;
@@ -92,6 +95,7 @@ use crate::raft::LogSegment;
 use crate::raft::ReadPolicy;
 use crate::raft::StreamAppendError;
 use crate::raft::VoteRequest;
+#[cfg(not(feature = "sync-core"))]
 use crate::raft::VoteResponse;
 use crate::raft::linearizable_read::Linearizer;
 use crate::raft::message::TransferLeaderRequest;
@@ -109,6 +113,7 @@ use crate::replication::replication_handle::ReplicationHandle;
 use crate::replication::replication_progress;
 use crate::replication::snapshot_transmitter::SnapshotTransmitter;
 use crate::runtime::RaftRuntime;
+#[cfg(not(feature = "sync-core"))]
 use crate::storage::IOFlushed;
 use crate::storage::RaftLogStorage;
 use crate::type_config::TypeConfigExt;
@@ -129,6 +134,7 @@ use crate::type_config::async_runtime::mpsc::MpscSender;
 use crate::vote::RaftLeaderId;
 use crate::vote::RaftVote;
 use crate::vote::raft_vote::RaftVoteExt;
+#[cfg(not(feature = "sync-core"))]
 use crate::vote::vote_status::VoteStatus;
 
 /// The result of applying log entries to state machine.
@@ -180,7 +186,26 @@ where
     pub(crate) network_factory: NF,
 
     /// The [`RaftLogStorage`] implementation.
+    ///
+    /// Under `sync-core` the durability consumer (`sync_durability`) is the sole owner of
+    /// the log store: `SyncCore::new` `take()`s it out and moves it to the consumer thread.
+    /// It is an `Option` only there so it can be moved out while keeping the rest of
+    /// `RaftCore`; under the feature `RaftCore` never reads it again (the 5 storage write
+    /// arms of `run_command` are unreachable, and `get_log_reader` is rerouted through the
+    /// consumer via `log_reader_request_tx`).
+    #[cfg(not(feature = "sync-core"))]
     pub(crate) log_store: LS,
+    #[cfg(feature = "sync-core")]
+    pub(crate) log_store: Option<LS>,
+
+    /// Reader-requester for the consumer-owned log store (`sync-core` only).
+    ///
+    /// `get_log_reader` is still needed on the consensus side by the delegated
+    /// replication-spawn path, but the store now lives on the durability consumer. This
+    /// channel requests a fresh `LogReader` from the consumer, which replies on the oneshot.
+    #[cfg(feature = "sync-core")]
+    pub(crate) log_reader_request_tx:
+        std::sync::mpsc::Sender<crate::type_config::alias::OneshotSenderOf<C, LS::LogReader>>,
 
     /// A controlling handle to the [`RaftStateMachine`] worker.
     ///
@@ -1051,11 +1076,24 @@ where
             remote_matched: prog.progress.matching.clone(),
         };
 
+        // Obtain a log reader. Under `sync-core` the log store lives on the durability
+        // consumer, so request a fresh reader from it (rather than `self.log_store`).
+        #[cfg(not(feature = "sync-core"))]
+        let log_reader = self.log_store.get_log_reader().await;
+        #[cfg(feature = "sync-core")]
+        let log_reader = {
+            let (tx, rx) = C::oneshot();
+            // The consumer is alive for the lifetime of `SyncCore`; replication streams are
+            // only spawned while the consensus loop runs.
+            self.log_reader_request_tx.send(tx).expect("log-store consumer alive while spawning replication");
+            rx.await.expect("log-store consumer vends a reader")
+        };
+
         let join_handle = ReplicationCore::<C, NF, LS>::spawn(
             replication_context,
             progress,
             network,
-            self.log_store.get_log_reader().await,
+            log_reader,
             event_watcher,
             tracing::span!(parent: &self.span, Level::DEBUG, "replication", id=display(&self.id), target=display(&prog.target)),
         );
@@ -2257,6 +2295,20 @@ where
 
                 self.tx_notification.send(notify).await.ok();
             }
+            // Under `sync-core` the durability consumer (`sync_durability`) owns the log
+            // store and executes all 5 storage write ops; `SyncCore::run_command` never
+            // delegates them here, so these arms are unreachable. They are cfg-gated out
+            // (the store field is `Option<LS>` under the feature; this keeps `RaftCore`
+            // from referencing it).
+            #[cfg(feature = "sync-core")]
+            Command::AppendEntries { .. }
+            | Command::SaveVote { .. }
+            | Command::PurgeLog { .. }
+            | Command::TruncateLog { .. }
+            | Command::SaveCommittedAndApply { .. } => {
+                unreachable!("under sync-core the log-store consumer owns storage write execution")
+            }
+            #[cfg(not(feature = "sync-core"))]
             Command::AppendEntries {
                 committed_vote: vote,
                 entries,
@@ -2296,6 +2348,7 @@ where
                 // Submit IO request, do not wait for the response.
                 self.log_store.append(entries, callback).await.sto_write_logs()?;
             }
+            #[cfg(not(feature = "sync-core"))]
             Command::SaveVote { vote } => {
                 let io_id = IOId::new(&vote);
 
@@ -2326,6 +2379,7 @@ where
                         .ok();
                 }
             }
+            #[cfg(not(feature = "sync-core"))]
             Command::PurgeLog { upto } => {
                 self.log_store.purge(upto.clone()).await.sto_write_logs()?;
 
@@ -2345,6 +2399,7 @@ where
 
                 self.engine.state.io_state_mut().update_purged(Some(upto));
             }
+            #[cfg(not(feature = "sync-core"))]
             Command::TruncateLog { after } => {
                 self.log_store.truncate_after(after.clone()).await.sto_write_logs()?;
 
@@ -2373,6 +2428,7 @@ where
             Command::BroadcastHeartbeat { session_id } => {
                 self.broadcast_heartbeat(session_id);
             }
+            #[cfg(not(feature = "sync-core"))]
             Command::SaveCommittedAndApply {
                 already_applied: already_committed,
                 upto,

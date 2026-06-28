@@ -41,6 +41,10 @@ use crate::batch::Batch;
 use crate::core::RaftCore;
 use crate::core::ServerState;
 use crate::core::balancer::Balancer;
+use crate::core::sync_durability;
+use crate::core::sync_durability::DurabilityOp;
+use crate::core::sync_durability::LogStoreHandle;
+use crate::core::sync_durability::ReaderRequest;
 use crate::core::notification::Notification;
 use crate::core::stage::Stage;
 use crate::engine::Command;
@@ -49,7 +53,6 @@ use crate::errors::ClientWriteError;
 use crate::errors::Fatal;
 use crate::errors::ForwardToLeader;
 use crate::errors::Infallible;
-use crate::errors::StorageIOResult;
 use crate::log_id::option_raft_log_id_ext::OptionRaftLogIdExt;
 use crate::network::RaftNetworkFactory;
 use crate::raft::responder::Responder;
@@ -58,7 +61,6 @@ use crate::raft_state::io_state::io_id::IOId;
 use crate::raft_state::LogStateReader;
 use crate::rt::MpscSender;
 use crate::runtime::RaftRuntime;
-use crate::storage::IOFlushed;
 use crate::storage::RaftLogStorage;
 use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::OneshotReceiverOf;
@@ -75,6 +77,11 @@ where
     LS: RaftLogStorage<C>,
 {
     core: RaftCore<C, NF, LS, SM>,
+
+    /// Handle to the durability (log-store) consumer thread, which owns `log_store` and
+    /// executes all storage write I/O reactor-free. Dropping it shuts the consumer down
+    /// (the producer drop signals ring shutdown) and joins the thread.
+    durability: LogStoreHandle<C>,
 }
 
 impl<C, NF, LS, SM> SyncCore<C, NF, LS, SM>
@@ -84,8 +91,27 @@ where
     LS: RaftLogStorage<C>,
     SM: 'static,
 {
-    pub(crate) fn new(core: RaftCore<C, NF, LS, SM>) -> Self {
-        Self { core }
+    pub(crate) fn new(
+        mut core: RaftCore<C, NF, LS, SM>,
+        reader_rx: std::sync::mpsc::Receiver<ReaderRequest<C, LS>>,
+    ) -> Self {
+        // The durability consumer becomes the sole owner of `log_store`.
+        let log_store = core.log_store.take().expect("log_store present at SyncCore construction");
+        let durability = sync_durability::spawn(log_store, reader_rx);
+        Self { core, durability }
+    }
+
+    /// Await a storage-write completion signalled by the durability consumer, mapping a
+    /// dropped consumer (oneshot cancelled) to a storage error.
+    async fn await_completion(
+        rx: OneshotReceiverOf<C, Result<(), StorageError<C>>>,
+    ) -> Result<(), StorageError<C>> {
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Err(StorageError::write(C::err_from_string(
+                "durability consumer dropped before completing IO",
+            ))),
+        }
     }
 
     /// Entry point. Mirrors `RaftCore::main`: run `do_main`, then flush metrics
@@ -330,17 +356,40 @@ where
                     r.record_append_batch(entry_count);
                 }
                 let io_id = IOId::new_log_io(vote, Some(last_log_id));
-                let callback = IOFlushed::new(io_id.clone(), self.core.tx_io_completed.clone());
+                // Before-work stays on the consensus loop, ahead of publish.
                 self.core.io_accepted_tx.send_if_greater(io_id.clone());
                 self.core.engine.state.log_progress_mut().submit(io_id.clone());
                 self.core.runtime_stats.record_log_stage_now(Stage::Submitted, last_log_index + 1);
-                self.core.log_store.append(entries, callback).await.sto_write_logs()?;
+                // Uniform-await (Task 1): publish + await *submission*. The consumer builds the
+                // `IOFlushed` callback from `io_id` + `tx_io_completed` and signals `done` once
+                // `append` returns, which the contract guarantees is the *readable* point. We
+                // await that before returning, restoring the original invariant "submitted ⇒
+                // entries readable before this arm returns" — so a later `Replicate` (gated on
+                // the consensus *submitted* marker) cannot read not-yet-readable entries across
+                // the consensus→consumer thread boundary. Flush completion still flows via the
+                // callback → forwarder → `Notification::LocalIO` path, unchanged.
+                //
+                // TASK 2 (AppendEntries pipelined) reintroduces fire-and-forget here, but MUST
+                // first add a real readability gate (e.g. gate `Replicate` on the consumer's
+                // append-submit signal, not just the consensus `submit` marker) before dropping
+                // this await — that is the invariant this await currently upholds.
+                let (tx, rx) = C::oneshot();
+                self.durability.publish(DurabilityOp::Append {
+                    entries,
+                    io_id,
+                    tx_io_completed: self.core.tx_io_completed.clone(),
+                    done: tx,
+                });
+                Self::await_completion(rx).await?;
             }
             Command::SaveVote { vote } => {
                 let io_id = IOId::new(&vote);
                 self.core.io_accepted_tx.send_if_greater(io_id.clone());
                 self.core.engine.state.log_progress_mut().submit(io_id.clone());
-                self.core.log_store.save_vote(&vote).await.sto_write_vote()?;
+                // Storage call on the consumer; await completion before the after-work.
+                let (tx, rx) = C::oneshot();
+                self.durability.publish(DurabilityOp::SaveVote { vote: vote.clone(), done: tx });
+                Self::await_completion(rx).await?;
                 self.core.tx_notification
                     .send(Notification::LocalIO { io_id: IOId::new(&vote) })
                     .await
@@ -357,7 +406,9 @@ where
                 }
             }
             Command::PurgeLog { upto } => {
-                self.core.log_store.purge(upto.clone()).await.sto_write_logs()?;
+                let (tx, rx) = C::oneshot();
+                self.durability.publish(DurabilityOp::Purge { upto: upto.clone(), done: tx });
+                Self::await_completion(rx).await?;
                 let leader_id = self.core.current_leader();
                 let leader_node = self.core.get_leader_node(leader_id.clone());
                 for (log_index, tx) in self.core.client_responders.drain_upto(upto.index()) {
@@ -370,7 +421,9 @@ where
                 self.core.engine.state.io_state_mut().update_purged(Some(upto));
             }
             Command::TruncateLog { after } => {
-                self.core.log_store.truncate_after(after.clone()).await.sto_write_logs()?;
+                let (tx, rx) = C::oneshot();
+                self.durability.publish(DurabilityOp::Truncate { after: after.clone(), done: tx });
+                Self::await_completion(rx).await?;
                 let leader_id = self.core.current_leader();
                 let leader_node = self.core.get_leader_node(leader_id.clone());
                 for (log_index, tx) in self.core.client_responders.drain_from(after.next_index()) {
@@ -384,7 +437,9 @@ where
             Command::SaveCommittedAndApply { already_applied: already_committed, upto } => {
                 self.core.runtime_stats.record_log_stage_now(Stage::Committed, upto.index() + 1);
                 self.core.engine.state.apply_progress_mut().submit(upto.clone());
-                self.core.log_store.save_committed(Some(upto.clone())).await.sto_write()?;
+                let (tx, rx) = C::oneshot();
+                self.durability.publish(DurabilityOp::SaveCommitted { committed: Some(upto.clone()), done: tx });
+                Self::await_completion(rx).await?;
                 let first = self.core.engine.state.get_log_id(already_committed.next_index()).unwrap();
                 self.core.apply_to_state_machine(first, upto).await?;
             }

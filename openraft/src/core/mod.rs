@@ -44,7 +44,9 @@ mod step_down_watcher;
 #[cfg(feature = "sync-core")]
 mod sync_core;
 #[cfg(feature = "sync-core")]
-#[allow(dead_code)] // spike scaffolding: block_on graduates to the runtime in 3b.2
+mod sync_durability;
+#[cfg(feature = "sync-core")]
+#[allow(dead_code)] // spike scaffolding: block_on graduated to sync_durability; module deleted in 3b.2 Task 4
 mod sync_durability_spike;
 mod tick;
 
