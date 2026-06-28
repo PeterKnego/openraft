@@ -12,14 +12,22 @@
 //! that same Engine from a synchronous loop (ultimately a busy-spin ring
 //! pipeline with isolated I/O consumers), keeping openraft's proven algorithm.
 //!
-//! ## Status: v3 — owns the event loop and all command drains
+//! ## Status: v4 — owns command execution for all storage/apply/pure-sync commands
 //!
-//! `SyncCore` now **owns the full orchestration**: `do_main` + `runtime_loop`,
-//! `process_raft_msg`, `process_notification`, `run_engine_commands`, and
-//! `run_progress_driven_command`. It still delegates only the engine-driving
-//! *per-message handlers* (`handle_api_msg`, `handle_notification`) and the
-//! actual I/O executor (`run_command`) to `RaftCore`. Those are what the next
-//! step replaces with synchronous, ring-dispatched execution.
+//! `SyncCore` now **owns the full orchestration and command execution**.
+//! Methods owned: `do_main`, `runtime_loop`, `process_raft_msg`,
+//! `process_notification`, `run_engine_commands`, `run_progress_driven_command`,
+//! and `run_command`.
+//!
+//! Within `run_command`, all storage/apply/pure-sync commands execute inline:
+//! `AppendEntries`, `SaveVote`, `PurgeLog`, `TruncateLog`, `UpdateIOProgress`,
+//! `ReplicateCommitted`, `Respond`, `SaveCommittedAndApply`, `StateMachine`.
+//!
+//! Still delegated to `RaftCore`: the 8 task-spawning / network commands
+//! (`SendVote`, `SendPreVote`, `BroadcastHeartbeat`, `Replicate`,
+//! `ReplicateSnapshot`, `BroadcastTransferLeader`, `CloseReplicationStreams`,
+//! `RebuildReplicationStreams`) and the two engine-driving per-message handlers
+//! (`handle_api_msg`, `handle_notification`). Phase 3c relocates these.
 //!
 //! Validated by running openraft's own integration suite with
 //! `--features sync-core`.
@@ -44,14 +52,15 @@ use crate::errors::Infallible;
 use crate::errors::StorageIOResult;
 use crate::log_id::option_raft_log_id_ext::OptionRaftLogIdExt;
 use crate::network::RaftNetworkFactory;
-use crate::raft::VoteResponse;
 use crate::raft::responder::Responder;
-use crate::raft_state::LogStateReader;
+use crate::raft::VoteResponse;
 use crate::raft_state::io_state::io_id::IOId;
+use crate::raft_state::LogStateReader;
 use crate::rt::MpscSender;
 use crate::runtime::RaftRuntime;
 use crate::storage::IOFlushed;
 use crate::storage::RaftLogStorage;
+use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::OneshotReceiverOf;
 use crate::vote::raft_vote::RaftVoteExt;
 use crate::vote::vote_status::VoteStatus;
@@ -372,8 +381,32 @@ where
                     tracing::debug!("sent ForwardToLeader for log_index: {}", log_index);
                 }
             }
-            // Commit/apply arms move inline in Task 3; task-spawning already delegated above.
-            _ => return self.core.run_command(cmd).await,
+            Command::SaveCommittedAndApply { already_applied: already_committed, upto } => {
+                self.core.runtime_stats.record_log_stage_now(Stage::Committed, upto.index() + 1);
+                self.core.engine.state.apply_progress_mut().submit(upto.clone());
+                self.core.log_store.save_committed(Some(upto.clone())).await.sto_write()?;
+                let first = self.core.engine.state.get_log_id(already_committed.next_index()).unwrap();
+                self.core.apply_to_state_machine(first, upto).await?;
+            }
+            Command::StateMachine { command } => {
+                let io_id = command.get_log_progress();
+                if let Some(io_id) = io_id {
+                    self.core.engine.state.log_progress_mut().submit(io_id);
+                }
+                if let Some(log_id) = command.get_apply_progress() {
+                    self.core.engine.state.apply_progress_mut().submit(log_id);
+                }
+                if let Some(log_id) = command.get_snapshot_progress() {
+                    self.core.engine.state.snapshot_progress_mut().submit(log_id);
+                }
+                self.core.sm_handle
+                    .send(command)
+                    .await
+                    .map_err(|_e| StorageError::write_state_machine(C::err_from_string("cannot send to sm::Worker")))?;
+            }
+            // All owned commands are explicit above; task-spawning commands returned
+            // via the by-ref delegate block at the top of run_command.
+            _ => unreachable!("task-spawning commands are delegated before this match"),
         }
         Ok(None)
     }
