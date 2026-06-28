@@ -26,6 +26,12 @@
 //!
 //! This module is feature-gated (`sync-core`). The reactor-free `block_on` graduates
 //! here from `sync_durability_spike.rs` (which is deleted once it is no longer used).
+//!
+//! **Gate self-heal on shutdown**: on a fatal append failure the sm-worker
+//! `GatedLogReader` may briefly block on a watermark that will never reach the failed
+//! index, but this self-heals because the fatal shutdown drops `LogStoreHandle` → the
+//! producer drops → the consumer exits → `readable_tx` drops → `wait_until_ge` returns
+//! `Err` and the gate proceeds best-effort.
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -40,6 +46,8 @@ use std::task::RawWaker;
 use std::task::RawWakerVTable;
 use std::task::Waker;
 use std::thread::JoinHandle;
+
+use futures_util::Stream;
 
 use disruptor::BusySpin;
 use disruptor::EventPoller;
@@ -183,6 +191,15 @@ where
     async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, std::io::Error> {
         self.inner.read_vote().await
     }
+
+    /// Override to preserve the inner reader's incremental streaming rather than
+    /// materialising the entire range into a `Vec` (the trait default). Gate on the
+    /// range END first, then delegate — same gating semantics as `try_get_log_entries`.
+    async fn entries_stream<RB>(&mut self, range: RB) -> impl Stream<Item = Result<EntryOf<C>, std::io::Error>> + OptionalSend
+    where RB: RangeBounds<u64> + Clone + Debug + OptionalSend {
+        self.await_readable(range_hi(&range)).await;
+        self.inner.entries_stream(range).await
+    }
 }
 
 /// One storage write op routed to the consumer.
@@ -323,10 +340,13 @@ fn consumer_loop<C, LS>(
     // with an existing log). Without this, the gate would block replication streams trying
     // to read entries that are already readable in storage, even though no Append op has
     // gone through the consumer yet.
-    let init = block_on(log_store.get_log_state())
-        .ok()
-        .and_then(|s| s.last_log_id)
-        .map(|l| l.index());
+    let init = match block_on(log_store.get_log_state()) {
+        Ok(s) => s.last_log_id.map(|l| l.index()),
+        Err(e) => {
+            tracing::warn!("sync-core: get_log_state priming failed (defaulting watermark to None): {}", e);
+            None
+        }
+    };
     readable_tx.send(init).ok();
 
     loop {
@@ -389,6 +409,7 @@ where
                     // Submission failed ⇒ the flush callback will not fire; surface the storage
                     // error through `tx_io_completed` so the forwarder turns it into a LocalIO
                     // notification the engine handles as fatal (matches RaftCore's append?-to-Fatal).
+                    // raw send is fine: this only ever sets Err; the IOFlushed callback's send_if_modified upholds Err-permanence downstream.
                     tx_io_completed.send(Err(e)).ok();
                 }
             }
