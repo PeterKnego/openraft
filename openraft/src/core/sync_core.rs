@@ -29,18 +29,32 @@ use futures_util::FutureExt;
 use crate::async_runtime::MpscReceiver;
 use crate::async_runtime::TryRecvError;
 use crate::async_runtime::watch::WatchSender;
+use crate::batch::Batch;
 use crate::core::RaftCore;
 use crate::core::ServerState;
 use crate::core::balancer::Balancer;
+use crate::core::notification::Notification;
+use crate::core::stage::Stage;
 use crate::engine::Command;
+use crate::entry::RaftEntry;
+use crate::errors::ClientWriteError;
 use crate::errors::Fatal;
+use crate::errors::ForwardToLeader;
 use crate::errors::Infallible;
+use crate::errors::StorageIOResult;
 use crate::log_id::option_raft_log_id_ext::OptionRaftLogIdExt;
 use crate::network::RaftNetworkFactory;
+use crate::raft::VoteResponse;
+use crate::raft::responder::Responder;
 use crate::raft_state::LogStateReader;
+use crate::raft_state::io_state::io_id::IOId;
+use crate::rt::MpscSender;
 use crate::runtime::RaftRuntime;
+use crate::storage::IOFlushed;
 use crate::storage::RaftLogStorage;
 use crate::type_config::alias::OneshotReceiverOf;
+use crate::vote::raft_vote::RaftVoteExt;
+use crate::vote::vote_status::VoteStatus;
 use crate::RaftTypeConfig;
 use crate::StorageError;
 
@@ -274,9 +288,94 @@ where
         if delegate {
             return self.core.run_command(cmd).await;
         }
-        // Owned commands (storage / apply / pure-sync) — delegated for now, moved
-        // inline in Tasks 2-3.
-        self.core.run_command(cmd).await
+
+        // Owned commands: condition gate + stats, then execute inline.
+        let condition = cmd.condition();
+        if let Some(condition) = condition
+            && !condition.is_met(&self.core.engine.state.io_state)
+        {
+            tracing::debug!("{} not yet met, postpone cmd: {}", condition, cmd);
+            return Ok(Some(cmd));
+        }
+        self.core.runtime_stats.record_command(cmd.name());
+
+        match cmd {
+            Command::UpdateIOProgress { io_id, .. } => {
+                self.core.io_accepted_tx.send_if_greater(io_id.clone());
+                self.core.engine.state.log_progress_mut().submit(io_id.clone());
+                let notify = Notification::LocalIO { io_id: io_id.clone() };
+                self.core.tx_notification.send(notify).await.ok();
+            }
+            Command::ReplicateCommitted { committed } => {
+                self.core.committed_tx.send_if_greater(committed);
+            }
+            Command::Respond { resp: send, .. } => {
+                send.send();
+            }
+            Command::AppendEntries { committed_vote: vote, entries } => {
+                let last_log_id = entries.last().unwrap().log_id();
+                let last_log_index = last_log_id.index();
+                let entry_count = entries.len() as u64;
+                self.core.runtime_stats.append_batch.record(entry_count);
+                if let Some(r) = &self.core.metrics_recorder {
+                    r.record_append_batch(entry_count);
+                }
+                let io_id = IOId::new_log_io(vote, Some(last_log_id));
+                let callback = IOFlushed::new(io_id.clone(), self.core.tx_io_completed.clone());
+                self.core.io_accepted_tx.send_if_greater(io_id.clone());
+                self.core.engine.state.log_progress_mut().submit(io_id.clone());
+                self.core.runtime_stats.record_log_stage_now(Stage::Submitted, last_log_index + 1);
+                self.core.log_store.append(entries, callback).await.sto_write_logs()?;
+            }
+            Command::SaveVote { vote } => {
+                let io_id = IOId::new(&vote);
+                self.core.io_accepted_tx.send_if_greater(io_id.clone());
+                self.core.engine.state.log_progress_mut().submit(io_id.clone());
+                self.core.log_store.save_vote(&vote).await.sto_write_vote()?;
+                self.core.tx_notification
+                    .send(Notification::LocalIO { io_id: IOId::new(&vote) })
+                    .await
+                    .ok();
+                if let VoteStatus::Pending(non_committed) = vote.clone().into_vote_status() {
+                    self.core.tx_notification
+                        .send(Notification::VoteResponse {
+                            target: self.core.id.clone(),
+                            resp: VoteResponse::new(vote, None, true),
+                            candidate_vote: non_committed,
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            Command::PurgeLog { upto } => {
+                self.core.log_store.purge(upto.clone()).await.sto_write_logs()?;
+                let leader_id = self.core.current_leader();
+                let leader_node = self.core.get_leader_node(leader_id.clone());
+                for (log_index, tx) in self.core.client_responders.drain_upto(upto.index()) {
+                    tx.on_complete(Err(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                        leader_id: leader_id.clone(),
+                        leader_node: leader_node.clone(),
+                    })));
+                    tracing::debug!("sent ForwardToLeader for purged log_index: {}", log_index);
+                }
+                self.core.engine.state.io_state_mut().update_purged(Some(upto));
+            }
+            Command::TruncateLog { after } => {
+                self.core.log_store.truncate_after(after.clone()).await.sto_write_logs()?;
+                let leader_id = self.core.current_leader();
+                let leader_node = self.core.get_leader_node(leader_id.clone());
+                for (log_index, tx) in self.core.client_responders.drain_from(after.next_index()) {
+                    tx.on_complete(Err(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                        leader_id: leader_id.clone(),
+                        leader_node: leader_node.clone(),
+                    })));
+                    tracing::debug!("sent ForwardToLeader for log_index: {}", log_index);
+                }
+            }
+            // Commit/apply arms move inline in Task 3; task-spawning already delegated above.
+            _ => return self.core.run_command(cmd).await,
+        }
+        Ok(None)
     }
 
     /// Mirrors `RaftCore::run_engine_commands`: drain and execute the Engine's
