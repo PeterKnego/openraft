@@ -37,6 +37,9 @@ tracing-subscriber  = { version = "0.3", optional = true }
 
 [features]
 bt = ["openraft/bt"]
+# Build the cluster through the experimental synchronous core (SyncCore) instead of
+# the async RaftCore. Used by the commit_latency A/B (build twice, with/without).
+sync-core = ["openraft/sync-core"]
 single-term-leader = []
 tokio-console = ["console-subscriber"]
 flamegraph = ["tracing-flame", "tracing-subscriber"]
