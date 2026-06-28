@@ -372,27 +372,16 @@ where
                 self.core.io_accepted_tx.send_if_greater(io_id.clone());
                 self.core.engine.state.log_progress_mut().submit(io_id.clone());
                 self.core.runtime_stats.record_log_stage_now(Stage::Submitted, last_log_index + 1);
-                // Uniform-await (Task 1): publish + await *submission*. The consumer builds the
-                // `IOFlushed` callback from `io_id` + `tx_io_completed` and signals `done` once
-                // `append` returns, which the contract guarantees is the *readable* point. We
-                // await that before returning, restoring the original invariant "submitted ⇒
-                // entries readable before this arm returns" — so a later `Replicate` (gated on
-                // the consensus *submitted* marker) cannot read not-yet-readable entries across
-                // the consensus→consumer thread boundary. Flush completion still flows via the
-                // callback → forwarder → `Notification::LocalIO` path, unchanged.
-                //
-                // TASK 2 (AppendEntries pipelined) reintroduces fire-and-forget here, but MUST
-                // first add a real readability gate (e.g. gate `Replicate` on the consumer's
-                // append-submit signal, not just the consensus `submit` marker) before dropping
-                // this await — that is the invariant this await currently upholds.
-                let (tx, rx) = C::oneshot();
+                // Fire-and-forget: publish and return. Flush completion flows via the `IOFlushed`
+                // callback → `tx_io_completed` → forwarder → `Notification::LocalIO` → engine, as
+                // in RaftCore. Readability for a later (delegated) `Replicate` is preserved by the
+                // durability consumer's readable-watermark + `GatedLogReader` (no consensus-loop
+                // wait). Submission errors surface via `tx_io_completed` (see `run_op`).
                 self.durability.publish(DurabilityOp::Append {
                     entries,
                     io_id,
                     tx_io_completed: self.core.tx_io_completed.clone(),
-                    done: tx,
                 });
-                Self::await_completion(rx).await?;
             }
             Command::SaveVote { vote } => {
                 let io_id = IOId::new(&vote);

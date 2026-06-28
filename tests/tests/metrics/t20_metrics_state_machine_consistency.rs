@@ -44,6 +44,12 @@ async fn metrics_state_machine_consistency() -> Result<()> {
         router.wait(&0, timeout()).state(ServerState::Leader, "n0 -> leader").await?;
     }
 
+    // With fire-and-forget AppendEntries, the election can complete before the LocalIO
+    // notification for log[0] arrives. Without an explicit wait, the initial membership
+    // at log index 0 may still be "effective but not committed" when add_learner runs,
+    // causing an InProgress error. Wait for log[0] to be locally committed first.
+    router.wait(&0, timeout()).committed_index_at_least(Some(0), "initial membership committed").await?;
+
     tracing::info!(log_index, "--- add one learner");
     router.add_learner(0, 1).await?;
     log_index += 1;

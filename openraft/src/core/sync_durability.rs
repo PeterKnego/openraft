@@ -183,12 +183,12 @@ where
 
 /// One storage write op routed to the consumer.
 ///
-/// All five carry a `done` oneshot the consumer signals once the storage call returns. For
-/// `Append`, that return point is *submitted/readable* (per the `RaftLogStorage::append`
-/// contract) — distinct from *flushed*, which still flows separately through the `IOFlushed`
-/// callback (built from `io_id` + the `tx_io_completed` watch). Awaiting `done` restores the
-/// "submitted ⇒ readable before the consensus arm returns" invariant across the
-/// consensus→consumer thread boundary (see the `AppendEntries` arm in `sync_core`).
+/// `Append` is **fire-and-forget**: the consensus loop publishes it and returns immediately;
+/// flush completion flows via the `IOFlushed` callback → `tx_io_completed` → forwarder →
+/// `Notification::LocalIO`, and readability for a later `Replicate` is preserved by the
+/// consumer's `readable` watermark + `GatedLogReader`. The other four ops carry a `done`
+/// oneshot the consumer signals once the storage call returns, so the consensus loop can
+/// run their after-work.
 pub(crate) enum DurabilityOp<C>
 where C: RaftTypeConfig
 {
@@ -196,7 +196,6 @@ where C: RaftTypeConfig
         entries: BatchOf<C, C::Entry>,
         io_id: IOId<C>,
         tx_io_completed: WatchSenderOf<C, Result<IOId<C>, StorageError<C>>>,
-        done: Done<C>,
     },
     SaveVote {
         vote: VoteOf<C>,
@@ -366,27 +365,22 @@ where
     LS: RaftLogStorage<C>,
 {
     match op {
-        DurabilityOp::Append {
-            entries,
-            io_id,
-            tx_io_completed,
-            done,
-        } => {
-            // Extract the last index BEFORE moving io_id into the callback.
+        DurabilityOp::Append { entries, io_id, tx_io_completed } => {
             let last_idx = io_id.last_log_id().map(|l| l.index());
-            let callback = IOFlushed::new(io_id, tx_io_completed);
-            // `append` returns at *submitted/readable* (per the `RaftLogStorage::append`
-            // contract); the `callback` drives the later *flush* completion, unchanged.
-            // Signal `done` with the submission result so the consensus arm's await unblocks
-            // only after the entries are readable. On a submission error the consensus arm's
-            // `?` goes Fatal (matching the original `append(..).await.sto_write_logs()?`),
-            // and the un-fired callback is simply dropped, as before.
-            let res = block_on(log_store.append(entries, callback)).sto_write_logs();
-            // FIFO consumer order ⇒ this is the current store high-water for appends.
-            if res.is_ok() && let Some(idx) = last_idx {
-                readable_tx.send(Some(idx)).ok();
+            let callback = IOFlushed::new(io_id, tx_io_completed.clone());
+            match block_on(log_store.append(entries, callback)).sto_write_logs() {
+                Ok(()) => {
+                    if let Some(idx) = last_idx {
+                        readable_tx.send(Some(idx)).ok();
+                    }
+                }
+                Err(e) => {
+                    // Submission failed ⇒ the flush callback will not fire; surface the storage
+                    // error through `tx_io_completed` so the forwarder turns it into a LocalIO
+                    // notification the engine handles as fatal (matches RaftCore's append?-to-Fatal).
+                    tx_io_completed.send(Err(e)).ok();
+                }
             }
-            done.send(res).ok();
         }
         DurabilityOp::SaveVote { vote, done } => {
             let res = block_on(log_store.save_vote(&vote)).sto_write_vote();
@@ -425,10 +419,12 @@ mod tests {
 
     /// Drives a `GatedLogReader` with the no-op-waker `block_on` and a side thread that
     /// advances the watermark. Asserts the inner read does NOT happen until the watermark
-    /// reaches the requested range's high index.
+    /// reaches the requested range's high index, with temporal-ordering evidence that the
+    /// gate actually blocked (not just that the inner read saw the right value).
     #[test]
     fn gated_reader_blocks_until_watermark_covers_range() {
         use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
         use std::sync::atomic::AtomicU64;
         use std::sync::atomic::Ordering;
 
@@ -437,11 +433,17 @@ mod tests {
         use crate::engine::testing::UTConfig;
         use crate::type_config::TypeConfigExt as _;
 
+        // Temporal-ordering flag: set to `true` by the advancer immediately before it sends
+        // the watermark value. The stub asserts it is already `true` when it runs — proving
+        // the gate actually blocked rather than the read racing past it.
+        static GATE_OPENED: AtomicBool = AtomicBool::new(false);
+
         // UTConfig is generic (UTConfig<N = ()>); be explicit to avoid type-inference ambiguity.
         type TC = UTConfig<()>;
         let (tx, rx) = TC::watch_channel::<Option<u64>>(None);
 
-        // Stub inner reader: records the highest index requested; returns empty.
+        // Stub inner reader: records the highest index requested AND asserts the gate was already
+        // open (GATE_OPENED true) before it ran. Returns empty.
         #[derive(Clone)]
         struct Stub(Arc<AtomicU64>);
         impl RaftLogReader<TC> for Stub {
@@ -449,6 +451,12 @@ mod tests {
                 &mut self,
                 range: RB,
             ) -> Result<Vec<crate::type_config::alias::EntryOf<TC>>, std::io::Error> {
+                // This assertion is the load-bearing part: if the gate didn't block, the advancer
+                // thread will not have set GATE_OPENED yet and this panics.
+                assert!(
+                    GATE_OPENED.load(Ordering::SeqCst),
+                    "inner read ran before the gate opened — the gate did not block"
+                );
                 let end = match range.end_bound() {
                     std::ops::Bound::Included(&e) => e,
                     std::ops::Bound::Excluded(&e) => e.saturating_sub(1),
@@ -473,6 +481,8 @@ mod tests {
             for _ in 0..1000 {
                 std::hint::spin_loop();
             }
+            // Set the flag BEFORE sending the watermark so the stub's assertion holds.
+            GATE_OPENED.store(true, Ordering::SeqCst);
             tx.send(Some(5)).ok();
             // Keep tx alive until the reader has observed the value.
             std::thread::sleep(std::time::Duration::from_millis(50));
