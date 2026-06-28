@@ -77,6 +77,7 @@ use crate::runtime::RaftRuntime;
 use crate::storage::RaftLogStorage;
 use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::OneshotReceiverOf;
+use crate::type_config::alias::WatchSenderOf;
 use crate::vote::raft_vote::RaftVoteExt;
 use crate::vote::vote_status::VoteStatus;
 use crate::RaftTypeConfig;
@@ -107,10 +108,11 @@ where
     pub(crate) fn new(
         mut core: RaftCore<C, NF, LS, SM>,
         reader_rx: std::sync::mpsc::Receiver<ReaderRequest<C, LS>>,
+        readable_tx: WatchSenderOf<C, Option<u64>>,
     ) -> Self {
         // The durability consumer becomes the sole owner of `log_store`.
         let log_store = core.log_store.take().expect("log_store present at SyncCore construction");
-        let durability = sync_durability::spawn(log_store, reader_rx);
+        let durability = sync_durability::spawn(log_store, reader_rx, readable_tx);
         Self { core, durability }
     }
 
@@ -442,14 +444,10 @@ where
                 // and apply does not depend on it being durable; FIFO consumer order keeps the
                 // persisted committed marker monotonic.
                 self.durability.publish(DurabilityOp::SaveCommitted { committed: Some(upto.clone()) });
-                // The sm worker holds a raw (ungated) log reader. Wait until the consumer's
-                // readable watermark covers upto.index() before dispatching the apply command,
-                // so the sm worker can see the committed entries. The consumer processes ops FIFO,
-                // so readable >= upto.index() implies all preceding Append ops have completed.
-                // This replaces the old over-broad await_completion(save_committed) barrier with
-                // a targeted wait: we only block until entries are readable, not until the
-                // advisory marker is persisted — so save_committed is now truly fire-and-forget.
-                self.durability.wait_readable(upto.index()).await;
+                // No on-loop wait here: the sm worker's log reader is a `GatedLogReader` whose
+                // readability watermark is updated by the durability consumer after each `Append`.
+                // The gate blocks the sm worker's `entries_stream` reads until the consumer has
+                // completed all preceding Append ops, keeping the wait off the consensus loop.
                 let first = self.core.engine.state.get_log_id(already_committed.next_index()).unwrap();
                 self.core.apply_to_state_machine(first, upto).await?;
             }

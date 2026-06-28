@@ -60,7 +60,6 @@ use crate::raft_state::io_state::io_id::IOId;
 use crate::storage::IOFlushed;
 use crate::storage::RaftLogReader;
 use crate::storage::RaftLogStorage;
-use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::BatchOf;
 use crate::type_config::alias::EntryOf;
 use crate::type_config::alias::LogIdOf;
@@ -238,10 +237,6 @@ where C: RaftTypeConfig
     /// producer is what signals `Polling::Shutdown` to the consumer).
     producer: Option<SingleProducer<DurabilityEvent<C>, SingleConsumerBarrier>>,
     join: Option<JoinHandle<()>>,
-    /// Subscriber to the consumer's readable watermark — updated after each `Append` op.
-    /// Used by [`LogStoreHandle::wait_readable`] to ensure the sm worker's raw reader
-    /// can see committed entries before an apply command is dispatched.
-    readable_sub: WatchReceiverOf<C, Option<u64>>,
 }
 
 impl<C> LogStoreHandle<C>
@@ -254,26 +249,6 @@ where C: RaftTypeConfig
             // `slot` is `&mut DurabilityEvent`; `get_mut` skips the (uncontended) lock.
             *slot.op.get_mut().unwrap() = Some(op);
         });
-    }
-
-    /// Wait until the consumer's readable watermark reaches `index`.
-    ///
-    /// Call this before dispatching `apply_to_state_machine` when running under
-    /// `sync-core`: the sm worker holds a raw (ungated) log reader, so we must
-    /// ensure the consumer has completed all preceding `Append` ops before the sm
-    /// worker can read the committed entries. The consumer processes ops FIFO, so
-    /// once `readable >= index`, all `Append` ops for entries up to `index` have
-    /// been persisted and are visible to raw readers.
-    ///
-    /// This replaces the old implicit barrier that came from `await_completion(rx)`
-    /// for `SaveCommitted` (which ensured FIFO Append completion as a side-effect).
-    /// Unlike that approach, this wait is targeted: we only block until entries are
-    /// readable, not until the advisory `save_committed` marker is persisted.
-    ///
-    /// Best-effort: if the consumer exits (watch sender dropped), we proceed and
-    /// let the apply path surface the storage error.
-    pub(crate) async fn wait_readable(&mut self, index: u64) {
-        let _ = self.readable_sub.wait_until_ge(&Some(index)).await;
     }
 }
 
@@ -292,11 +267,17 @@ where C: RaftTypeConfig
 
 /// Spawn the log-store consumer thread, transferring ownership of `log_store` to it.
 ///
+/// `readable_tx` is the watch sender for the readability watermark; it must be created by the
+/// caller (in `raft/mod.rs`) BEFORE the sm `Worker::spawn` call so that the sm worker's
+/// `GatedLogReader` already holds a receiver. This ensures the consumer's startup priming
+/// send is never dropped for lack of receivers.
+///
 /// Returns the [`LogStoreHandle`] (write-ring producer + join handle). The caller wires the
 /// matching reader-request `Sender` into `RaftCore` (see `raft/mod.rs`).
 pub(crate) fn spawn<C, LS>(
     log_store: LS,
     reader_rx: mpsc::Receiver<ReaderRequest<C, LS>>,
+    readable_tx: WatchSenderOf<C, Option<u64>>,
 ) -> LogStoreHandle<C>
 where
     C: RaftTypeConfig,
@@ -309,21 +290,17 @@ where
     let (poller, builder) = build_single_producer(1024, factory, BusySpin).new_event_poller();
     let producer = builder.build();
 
-    // Readable watermark: highest log index currently in the store. Vended readers gate on it.
-    // The consumer keeps `readable_rx0` alive so that `send()` never silently drops updates
-    // before the first `subscribe()` is called: tokio watch's `send()` discards the value if
-    // all receivers have been dropped.
-    let (readable_tx, readable_rx0) = C::watch_channel::<Option<u64>>(None);
-    // Subscribe before moving tx into thread: LogStoreHandle exposes wait_readable()
-    // so the consensus loop can gate apply dispatch on entry readability.
-    let readable_sub = readable_tx.subscribe();
+    // Keep a receiver alive on this side so the consumer's priming send (before any sm
+    // subscriber has received) is not silently dropped by tokio watch. The sm worker's
+    // GatedLogReader already holds one receiver (created before this call), so together
+    // there are always ≥1 receivers during startup.
+    let readable_rx0 = readable_tx.subscribe();
 
     let join = std::thread::spawn(move || consumer_loop::<C, LS>(log_store, poller, reader_rx, readable_tx, readable_rx0));
 
     LogStoreHandle {
         producer: Some(producer),
         join: Some(join),
-        readable_sub,
     }
 }
 

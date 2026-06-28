@@ -51,6 +51,8 @@ pub(crate) use client_responder_queue::ClientResponderQueue;
 #[cfg(feature = "sync-core")]
 pub(crate) use sync_core::SyncCore;
 #[cfg(feature = "sync-core")]
+pub(crate) use sync_durability::GatedLogReader;
+#[cfg(feature = "sync-core")]
 pub(crate) use sync_durability::VendedReader;
 pub use notification_name::NotificationName;
 pub(crate) use raft_core::ApplyResult;

@@ -503,9 +503,22 @@ where
 
         let sm_span = tracing::span!(parent: &core_span, Level::DEBUG, "sm_worker");
 
+        // Under `sync-core`, the durability consumer is the sole owner of `log_store`, so
+        // append is fire-and-forget. The sm worker's reader must be gated on the consumer's
+        // readable watermark so it never short-reads an entry that is in-flight. We create the
+        // watch here — before `Worker::spawn` — so the sm worker's `GatedLogReader` already
+        // holds a receiver when the consumer's startup priming send fires.
+        #[cfg(feature = "sync-core")]
+        let (readable_tx, readable_rx) = C::watch_channel::<Option<u64>>(None);
+
+        #[cfg(not(feature = "sync-core"))]
+        let sm_log_reader = log_store.get_log_reader().await;
+        #[cfg(feature = "sync-core")]
+        let sm_log_reader = crate::core::GatedLogReader::new(log_store.get_log_reader().await, readable_rx);
+
         let sm_handle = worker::Worker::spawn(
             state_machine,
-            log_store.get_log_reader().await,
+            sm_log_reader,
             tx_notify.clone(),
             config.state_machine_channel_size(),
             sm_span,
@@ -600,7 +613,7 @@ where
             // drive need a runtime to run on. The thread reports its terminal result over a
             // oneshot; a thin tokio task awaits it so `CoreState::Running` keeps its expected
             // `C::JoinHandle` type.
-            let sync_core = crate::core::SyncCore::new(core, log_reader_request_rx);
+            let sync_core = crate::core::SyncCore::new(core, log_reader_request_rx, readable_tx);
             let rt_handle = tokio::runtime::Handle::current();
             let (tx_done, rx_done) = C::oneshot();
             std::thread::Builder::new()
