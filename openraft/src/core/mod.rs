@@ -43,6 +43,9 @@ mod shared_replicate_batch;
 mod step_down_watcher;
 #[cfg(feature = "sync-core")]
 mod sync_core;
+#[cfg(feature = "sync-core")]
+#[allow(dead_code)] // spike scaffolding: block_on graduates to the runtime in 3b.2
+mod sync_durability_spike;
 mod tick;
 
 pub(crate) use client_responder_queue::ClientResponderQueue;

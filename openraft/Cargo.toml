@@ -27,6 +27,7 @@ byte-unit       = { workspace = true, optional = true }
 chrono          = { workspace = true }
 clap            = { workspace = true, optional = true }
 derive_more     = { workspace = true }
+disruptor       = { version = "4.3", optional = true }
 display-more    = { workspace = true }
 futures-util    = { workspace = true }
 itertools       = { workspace = true }
@@ -58,7 +59,7 @@ tokio-rt = ["dep:openraft-rt-tokio"]
 # Experimental: drive the Raft `Engine` from a synchronous core (`SyncCore`)
 # instead of the async `RaftCore`. Validates a disruptor-style execution harness
 # while reusing openraft's own test suite. `Raft::new` builds SyncCore when set.
-sync-core = []
+sync-core = ["dep:disruptor"]
 
 # Enable building `Config` from command-line arguments via `Config::build`.
 #
