@@ -16,8 +16,13 @@
 //!  - `Append` is **fire-and-forget** — its `IOFlushed` callback (fired by
 //!    `log_store.append`) drives the existing `tx_io_completed` → forwarder →
 //!    `Notification::LocalIO` path. No oneshot.
-//!  - the other four ops carry a `done` oneshot; the consumer signals it after the
-//!    storage call so the consensus loop can run the op's consensus-state after-work.
+//!  - `SaveCommitted` is **fire-and-forget** — it is optional/advisory (trait default
+//!    no-op; openraft tolerates a lagging committed marker); errors are logged, not
+//!    propagated. Apply does not depend on it being durable; FIFO consumer order keeps
+//!    the persisted marker monotonic.
+//!  - the other three ops (`SaveVote`, `Purge`, `Truncate`) carry a `done` oneshot;
+//!    the consumer signals it after the storage call so the consensus loop can run the
+//!    op's consensus-state after-work.
 //!
 //! This module is feature-gated (`sync-core`). The reactor-free `block_on` graduates
 //! here from `sync_durability_spike.rs` (which is deleted once it is no longer used).
@@ -183,12 +188,13 @@ where
 
 /// One storage write op routed to the consumer.
 ///
-/// `Append` is **fire-and-forget**: the consensus loop publishes it and returns immediately;
-/// flush completion flows via the `IOFlushed` callback → `tx_io_completed` → forwarder →
-/// `Notification::LocalIO`, and readability for a later `Replicate` is preserved by the
-/// consumer's `readable` watermark + `GatedLogReader`. The other four ops carry a `done`
-/// oneshot the consumer signals once the storage call returns, so the consensus loop can
-/// run their after-work.
+/// `Append` and `SaveCommitted` are **fire-and-forget**: the consensus loop publishes them
+/// and returns immediately. `Append` flush completion flows via the `IOFlushed` callback →
+/// `tx_io_completed` → forwarder → `Notification::LocalIO`; readability for a later
+/// `Replicate` is preserved by the consumer's `readable` watermark + `GatedLogReader`.
+/// `SaveCommitted` is advisory (errors logged, not propagated). The other three ops
+/// (`SaveVote`, `Purge`, `Truncate`) carry a `done` oneshot the consumer signals once the
+/// storage call returns, so the consensus loop can run their after-work.
 pub(crate) enum DurabilityOp<C>
 where C: RaftTypeConfig
 {
@@ -211,7 +217,6 @@ where C: RaftTypeConfig
     },
     SaveCommitted {
         committed: Option<LogIdOf<C>>,
-        done: Done<C>,
     },
 }
 
@@ -233,6 +238,10 @@ where C: RaftTypeConfig
     /// producer is what signals `Polling::Shutdown` to the consumer).
     producer: Option<SingleProducer<DurabilityEvent<C>, SingleConsumerBarrier>>,
     join: Option<JoinHandle<()>>,
+    /// Subscriber to the consumer's readable watermark — updated after each `Append` op.
+    /// Used by [`LogStoreHandle::wait_readable`] to ensure the sm worker's raw reader
+    /// can see committed entries before an apply command is dispatched.
+    readable_sub: WatchReceiverOf<C, Option<u64>>,
 }
 
 impl<C> LogStoreHandle<C>
@@ -245,6 +254,26 @@ where C: RaftTypeConfig
             // `slot` is `&mut DurabilityEvent`; `get_mut` skips the (uncontended) lock.
             *slot.op.get_mut().unwrap() = Some(op);
         });
+    }
+
+    /// Wait until the consumer's readable watermark reaches `index`.
+    ///
+    /// Call this before dispatching `apply_to_state_machine` when running under
+    /// `sync-core`: the sm worker holds a raw (ungated) log reader, so we must
+    /// ensure the consumer has completed all preceding `Append` ops before the sm
+    /// worker can read the committed entries. The consumer processes ops FIFO, so
+    /// once `readable >= index`, all `Append` ops for entries up to `index` have
+    /// been persisted and are visible to raw readers.
+    ///
+    /// This replaces the old implicit barrier that came from `await_completion(rx)`
+    /// for `SaveCommitted` (which ensured FIFO Append completion as a side-effect).
+    /// Unlike that approach, this wait is targeted: we only block until entries are
+    /// readable, not until the advisory `save_committed` marker is persisted.
+    ///
+    /// Best-effort: if the consumer exits (watch sender dropped), we proceed and
+    /// let the apply path surface the storage error.
+    pub(crate) async fn wait_readable(&mut self, index: u64) {
+        let _ = self.readable_sub.wait_until_ge(&Some(index)).await;
     }
 }
 
@@ -274,8 +303,9 @@ where
     LS: RaftLogStorage<C>,
 {
     let factory = || DurabilityEvent::<C> { op: Mutex::new(None) };
-    // Power-of-two ring; generously sized — the consensus loop awaits the 4 non-append ops
-    // (so at most one in flight) and the consumer drains appends promptly.
+    // Power-of-two ring; generously sized — the consensus loop awaits the 3 durability ops
+    // (SaveVote/Purge/Truncate, at most one in flight) and drains appends + SaveCommitted
+    // promptly (fire-and-forget).
     let (poller, builder) = build_single_producer(1024, factory, BusySpin).new_event_poller();
     let producer = builder.build();
 
@@ -284,12 +314,16 @@ where
     // before the first `subscribe()` is called: tokio watch's `send()` discards the value if
     // all receivers have been dropped.
     let (readable_tx, readable_rx0) = C::watch_channel::<Option<u64>>(None);
+    // Subscribe before moving tx into thread: LogStoreHandle exposes wait_readable()
+    // so the consensus loop can gate apply dispatch on entry readability.
+    let readable_sub = readable_tx.subscribe();
 
     let join = std::thread::spawn(move || consumer_loop::<C, LS>(log_store, poller, reader_rx, readable_tx, readable_rx0));
 
     LogStoreHandle {
         producer: Some(producer),
         join: Some(join),
+        readable_sub,
     }
 }
 
@@ -398,9 +432,11 @@ where
             }
             done.send(res).ok();
         }
-        DurabilityOp::SaveCommitted { committed, done } => {
-            let res = block_on(log_store.save_committed(committed)).sto_write();
-            done.send(res).ok();
+        DurabilityOp::SaveCommitted { committed } => {
+            let res: Result<(), StorageError<C>> = block_on(log_store.save_committed(committed)).sto_write();
+            if let Err(e) = res {
+                tracing::warn!("sync-core: save_committed failed (advisory, ignored): {}", e);
+            }
         }
     }
 }
