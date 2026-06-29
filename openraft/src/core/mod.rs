@@ -45,6 +45,8 @@ mod step_down_watcher;
 mod sync_core;
 #[cfg(feature = "sync-core")]
 mod sync_durability;
+#[cfg(feature = "sync-core")]
+pub(crate) mod sync_network;
 mod tick;
 
 pub(crate) use client_responder_queue::ClientResponderQueue;
