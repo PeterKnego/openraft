@@ -93,6 +93,36 @@ pub(crate) fn block_on<F: Future>(fut: F) -> F::Output {
     }
 }
 
+/// Cooperative reactor-free `block_on`: like [`block_on`], but on `Pending` it sleeps briefly
+/// (off-CPU) instead of hard-spinning. Use this to drive futures that are *genuinely* async —
+/// network RPCs, replication backoff (`C::sleep`), and the durability-watermark gated reads —
+/// from a busy-spin consumer thread: those complete only when *other* threads make progress (the
+/// tokio runtime workers driving the transport / timers, or the durability consumer advancing the
+/// readability watermark).
+///
+/// Hard-spinning (`block_on`) — or even a `yield_now` spin — keeps the consumer thread runnable
+/// and starves those other threads under CPU oversubscription (many per-peer consumers in one
+/// process, e.g. the test suite). That starvation is not just a perf issue: it delays critical
+/// storage I/O such as a leader's vote flush past the vote-RPC timeout, breaking elections. A
+/// short off-CPU sleep frees the core; it adds only sub-millisecond latency per poll, which is
+/// immaterial here (latency tuning — e.g. a disruptor blocking wait strategy — is a later phase).
+/// Storage I/O completes on the first poll, so the durability consumer keeps the hard-spin
+/// [`block_on`].
+pub(crate) fn block_on_yielding<F: Future>(fut: F) -> F::Output {
+    /// Off-CPU pause between polls of a genuinely-async future on a busy-spin consumer thread.
+    const POLL_PAUSE: std::time::Duration = std::time::Duration::from_micros(50);
+
+    let mut fut = Box::pin(fut);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => std::thread::sleep(POLL_PAUSE),
+        }
+    }
+}
+
 /// Non-blocking single poll of a future with the reactor-free no-op waker. Returns
 /// `Poll::Ready(_)` if the future has already completed, `Poll::Pending` otherwise — it
 /// never spins. The synchronous consensus loop uses this to check the shutdown oneshot

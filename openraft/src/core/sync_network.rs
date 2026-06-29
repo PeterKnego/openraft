@@ -70,7 +70,7 @@ use crate::core::SharedReplicateBatch;
 use crate::core::VendedReader;
 use crate::core::heartbeat::event::HeartbeatEvent;
 use crate::core::notification::Notification;
-use crate::core::sync_durability::block_on;
+use crate::core::sync_durability::block_on_yielding;
 use crate::errors::RPCError;
 use crate::errors::ReplicationClosed;
 use crate::log_id_range::LogIdRange;
@@ -168,12 +168,19 @@ impl<C> Drop for PeerConsumerHandle<C>
 where C: RaftTypeConfig
 {
     fn drop(&mut self) {
-        // Drop the producer first → consumer observes `Polling::Shutdown` and exits.
+        // Drop the producer → the consumer observes `Polling::Shutdown` and exits on its next
+        // loop iteration.
         self.producer.take();
-        // Then join so the consumer thread is clean before we return.
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        // **Detach, do not join.** A drop happens on the consensus thread (e.g. a leader
+        // stepping down runs `CloseReplicationStreams` → clears the peer table → drops handles).
+        // The consumer only checks the ring for shutdown *between* drives, so it may be mid-wait
+        // — a backoff `C::sleep` to an unreachable follower can be hundreds of ms, and a slow RPC
+        // longer. Joining here would block the consensus thread for that whole duration, delaying
+        // critical work such as a vote flush past the vote-RPC timeout and breaking elections.
+        // The original `ReplicationCore` interrupts its waits via a `cancel_rx` select; this
+        // bounded port cannot, so it lets the thread finish its current drive and exit on its own
+        // (it gets no further ops; the producer is gone). Dropping the `JoinHandle` detaches it.
+        drop(self.join.take());
     }
 }
 
@@ -372,7 +379,7 @@ where C: RaftTypeConfig
         self.tx_notify
             .send(Notification::HeartbeatProgress {
                 stream_id: self.stream_id,
-                sending_time: heartbeat.time.clone(),
+                sending_time: heartbeat.time,
                 target: self.target.clone(),
             })
             .await
@@ -533,6 +540,11 @@ where
         let Some(payload) = &self.payload else {
             return false;
         };
+        // A stale executor (old leader) makes no progress; let it idle until its handle is
+        // dropped (Close/Rebuild), rather than hot-looping `drive_replicate`'s no-op guard.
+        if self.event_watcher.io_accepted_rx.borrow_watched().leader_id() != self.ack.leader_vote.leader_id() {
+            return false;
+        }
         match payload {
             // A leftover (partially-sent) fixed range: keep sending the remainder.
             Payload::LogIdRange { .. } => true,
@@ -813,7 +825,7 @@ fn consumer_loop<C, N, LS>(
                 for event in &mut events {
                     let taken = event.op.lock().unwrap().take();
                     if let Some(op) = taken {
-                        block_on(executor.run_op(op));
+                        block_on_yielding(executor.run_op(op));
                         did_work = true;
                     }
                 }
@@ -825,16 +837,28 @@ fn consumer_loop<C, N, LS>(
         // Gate-driven re-drive: stream the LogsSince tail / partial range when there is real
         // progress to make (never an empty RPC per iteration).
         if executor.should_drive_replicate() {
-            let _ = block_on(executor.drive_replicate());
+            let _ = block_on_yielding(executor.drive_replicate());
             did_work = true;
         }
 
         if !did_work {
-            // Reactor-free idle: yield rather than peg the core.
-            std::thread::yield_now();
+            // Idle backoff. Unlike the single-per-node durability consumer, there are several
+            // network consumers per leader; a `yield_now` busy-spin across all of them
+            // oversubscribes CPU and starves the tokio runtime workers (quinn I/O, timers) when
+            // many clusters run in one process (the test suite). A short *off-CPU* sleep frees
+            // the core while idle; it only adds latency when there is genuinely no work to do (a
+            // published op or an advanced watermark wakes the next iteration). Steady-state
+            // replication never sleeps (did_work stays true). Latency tuning — e.g. a disruptor
+            // blocking wait strategy — is a later phase.
+            std::thread::sleep(IDLE_BACKOFF);
         }
     }
 }
+
+/// Off-CPU idle backoff for an otherwise-idle peer consumer. Small enough to be latency-
+/// negligible for correctness (suite timeouts are seconds), large enough to keep many idle
+/// consumers from oversubscribing CPU.
+const IDLE_BACKOFF: Duration = Duration::from_micros(100);
 
 #[cfg(test)]
 mod tests {
