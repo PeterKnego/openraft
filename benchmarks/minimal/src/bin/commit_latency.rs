@@ -57,10 +57,30 @@ struct Args {
     /// aggregate throughput.
     #[arg(short = 'c', long, default_value_t = 1)]
     concurrency: u64,
+
+    /// Injected per-commit committed-marker fsync latency (µs). Models the one hot-path
+    /// durability op the 3d redesign differentiates on: RaftCore awaits it inline (on the
+    /// commit critical path); SyncCore overlaps it off the consensus loop. Sweep this to find
+    /// where SyncCore crosses over RaftCore. 0 = off (the zero-latency baseline).
+    #[arg(long, default_value_t = 0)]
+    fsync_us: u64,
+
+    /// Injected per-RPC network RTT (µs) on the in-process router (multi-node only; common-mode
+    /// between cores in 3d). 0 = off.
+    #[arg(long, default_value_t = 0)]
+    rtt_us: u64,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // Publish the injected-latency knobs to the in-memory mocks (read at store/router
+    // construction in create_cluster, below). SAFETY: set before any runtime or thread is
+    // spawned — this is single-threaded process startup.
+    unsafe {
+        std::env::set_var("BENCH_FSYNC_US", args.fsync_us.to_string());
+        std::env::set_var("BENCH_RTT_US", args.rtt_us.to_string());
+    }
 
     let members: BTreeSet<u64> = (0..args.members).collect();
 
@@ -167,10 +187,12 @@ fn report(args: &Args, latencies: &mut [u64], wall: Duration) {
     let mean = latencies.iter().sum::<u64>() / n as u64;
 
     println!(
-        "{CORE_LABEL} members={} conc={} n={}: \
+        "{CORE_LABEL} members={} conc={} fsync_us={} rtt_us={} n={}: \
          min={} p50={} p90={} p99={} p99.9={} max={} mean={} (ns/op)",
         args.members,
         args.concurrency,
+        args.fsync_us,
+        args.rtt_us,
         n,
         latencies[0],
         pct(0.50),

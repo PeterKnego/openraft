@@ -88,9 +88,11 @@ impl RaftNetworkFactory<TypeConfig> for Router {
     type Network = Adapter<TypeConfig, Network>;
 
     async fn new_client(&mut self, target: NodeId, _node: &()) -> Self::Network {
+        let rtt_us = std::env::var("BENCH_RTT_US").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         Network {
             target,
             target_raft: self.table.lock().unwrap().get(&target).unwrap().clone(),
+            rtt_us,
         }
         .into_v2()
     }
@@ -99,6 +101,20 @@ impl RaftNetworkFactory<TypeConfig> for Router {
 pub struct Network {
     target: NodeId,
     target_raft: BenchRaft,
+    /// Injected per-RPC network RTT (µs), read from env `BENCH_RTT_US`; 0 disables. The
+    /// in-process router is on tokio for BOTH cores (replication is delegated/async in 3d),
+    /// so this is a `tokio::time::sleep` (async — overlaps like a real async wire) and is
+    /// common-mode between SyncCore and RaftCore here. It is for multi-node absolute-latency
+    /// realism; it does not differentiate the cores until replication moves off RaftCore (3c).
+    rtt_us: u64,
+}
+
+impl Network {
+    async fn delay(&self) {
+        if self.rtt_us > 0 {
+            tokio::time::sleep(Duration::from_micros(self.rtt_us)).await;
+        }
+    }
 }
 
 impl RaftNetwork<TypeConfig> for Network {
@@ -107,6 +123,7 @@ impl RaftNetwork<TypeConfig> for Network {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>> {
+        self.delay().await;
         let resp = self.target_raft.append_entries(rpc).await.map_err(|e| RemoteError::new(self.target, e))?;
         Ok(resp)
     }
@@ -117,6 +134,7 @@ impl RaftNetwork<TypeConfig> for Network {
         _option: RPCOption,
     ) -> Result<InstallSnapshotResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig, InstallSnapshotError>>>
     {
+        self.delay().await;
         let resp = self.target_raft.install_snapshot(rpc).await.map_err(|e| RemoteError::new(self.target, e))?;
         Ok(resp)
     }
@@ -126,6 +144,7 @@ impl RaftNetwork<TypeConfig> for Network {
         rpc: VoteRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>> {
+        self.delay().await;
         let resp = self.target_raft.vote(rpc).await.map_err(|e| RemoteError::new(self.target, e))?;
         Ok(resp)
     }

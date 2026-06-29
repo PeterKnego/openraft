@@ -97,16 +97,27 @@ pub struct LogStore {
     vote: RwLock<Option<Vote<LeaderId>>>,
     log: RwLock<BTreeMap<u64, EntryOf<TypeConfig>>>,
     last_purged_log_id: RwLock<Option<LogIdOf<TypeConfig>>>,
+    /// Injected per-commit committed-marker durability latency (µs) for `save_committed`,
+    /// modeling a blocking fsync. Read from env `BENCH_FSYNC_US` at construction; 0 disables.
+    /// This is the one hot-path durability op the 3d redesign differentiates on: RaftCore
+    /// `.await`s it inline on its core task (so it lands on the commit critical path), while
+    /// SyncCore publishes it fire-and-forget to the off-thread durability consumer (so it
+    /// overlaps). Append flush is overlapped by both cores (callback/notification), so it is
+    /// common-mode and left instant here.
+    fsync_us: u64,
 }
 
 impl LogStore {
     pub fn new() -> Self {
         let log = RwLock::new(BTreeMap::new());
 
+        let fsync_us = std::env::var("BENCH_FSYNC_US").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+
         Self {
             vote: RwLock::new(None),
             log,
             last_purged_log_id: RwLock::new(None),
+            fsync_us,
         }
     }
 
@@ -234,6 +245,22 @@ impl RaftLogStorage<TypeConfig> for Arc<LogStore> {
     async fn save_vote(&mut self, vote: &Vote<LeaderId>) -> Result<(), io::Error> {
         let mut v = self.vote.write().await;
         *v = Some(*vote);
+        Ok(())
+    }
+
+    async fn save_committed(&mut self, _committed: Option<LogIdOf<TypeConfig>>) -> Result<(), io::Error> {
+        // Model a blocking committed-marker fsync. A *blocking* sleep (std, not tokio) is the
+        // faithful model: the real journal's `StableValue.wait()` blocks the calling thread,
+        // and SyncCore's reactor-free durability consumer drives this under a never-park
+        // `block_on` where no tokio timer would fire. The behavioral split this measures:
+        // RaftCore `.await`s `save_committed` inline on its core task (the sleep stalls the
+        // core task → on the commit critical path), whereas SyncCore publishes it
+        // fire-and-forget to the off-thread consumer (the sleep stalls only the consumer →
+        // overlapped, off the consensus loop). We do not persist the marker — the bench never
+        // restarts a node, and the marker is advisory.
+        if self.fsync_us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(self.fsync_us));
+        }
         Ok(())
     }
 
