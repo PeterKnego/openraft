@@ -12,12 +12,12 @@
 //! that same Engine from a synchronous loop (ultimately a busy-spin ring
 //! pipeline with isolated I/O consumers), keeping openraft's proven algorithm.
 //!
-//! ## Status: v5 — synchronous consensus loop on a dedicated thread (minimal "3d")
+//! ## Status: v6 — all Engine commands owned (Phase 3c.1)
 //!
 //! `SyncCore` now runs its event loop **synchronously on a dedicated `std::thread`**,
 //! off the tokio scheduler. `Raft::new` spawns that thread (entering the tokio runtime
-//! *context* — the "hybrid reactor" — so the still-delegated replication commands'
-//! `C::spawn` and the network/IO it drives keep a runtime to run on), and the loop:
+//! *context* — the "hybrid reactor" — so `C::spawn`ed tasks and per-peer consumers'
+//! quinn I/O find a driver), and the loop:
 //!  - drains inputs with `try_recv` (`process_raft_msg`/`process_notification`) and polls
 //!    the shutdown oneshot non-blockingly — no async `select!`;
 //!  - drives the async storage/apply/network trait seam to completion with the
@@ -28,20 +28,22 @@
 //! 3b.2 moved off-thread. The follow-up completion-as-notification redesign feeds I/O
 //! completions back as later loop inputs to remove that.
 //!
-//! `SyncCore` **owns the full orchestration and command execution**.
-//! Methods owned: `run`, `do_main`, `runtime_loop`, `process_raft_msg`,
-//! `process_notification`, `run_engine_commands`, `run_progress_driven_command`,
-//! and `run_command`.
+//! **`SyncCore` owns every Engine [`Command`](crate::engine::Command)** — there is no
+//! `RaftCore::run_command` delegation left. Within `run_command`:
 //!
-//! Within `run_command`, all storage/apply/pure-sync commands execute inline:
-//! `AppendEntries`, `SaveVote`, `PurgeLog`, `TruncateLog`, `UpdateIOProgress`,
-//! `ReplicateCommitted`, `Respond`, `SaveCommittedAndApply`, `StateMachine`.
+//! - Storage / apply / pure-sync commands execute **inline** on the consensus thread:
+//!   `AppendEntries`, `SaveVote`, `PurgeLog`, `TruncateLog`, `UpdateIOProgress`,
+//!   `ReplicateCommitted`, `Respond`, `SaveCommittedAndApply`, `StateMachine`.
+//! - Replication / heartbeat / snapshot are **dispatched to per-peer network consumers**
+//!   (`sync_network.rs`): `Replicate`, `BroadcastHeartbeat`, `ReplicateSnapshot`,
+//!   `RebuildReplicationStreams`, `CloseReplicationStreams`.
+//! - Vote / transfer-leader commands (`SendVote`, `SendPreVote`, `BroadcastTransferLeader`)
+//!   **fan out off the consensus loop** via `spawn_parallel_vote_requests` /
+//!   `broadcast_transfer_leader`, each voter on its own `C::spawn`ed task (no peer
+//!   consumers exist during elections).
 //!
-//! Replication / heartbeat / snapshot run on the per-peer network consumers
-//! (`Replicate`, `BroadcastHeartbeat`, `ReplicateSnapshot`, `RebuildReplicationStreams`,
-//! `CloseReplicationStreams`). Still delegated to `RaftCore`: the vote / transfer-leader
-//! commands (`SendVote`, `SendPreVote`, `BroadcastTransferLeader`) and the two engine-driving
-//! per-message handlers (`handle_api_msg`, `handle_notification`). Task 4 relocates these.
+//! The ONLY residual `RaftCore` delegation is the two per-message handlers
+//! `handle_api_msg` and `handle_notification` (not `Command` dispatch).
 //!
 //! Validated by running openraft's own integration suite with
 //! `--features sync-core`.
@@ -640,6 +642,8 @@ where
             snapshot_reader,
         );
 
+        // INVARIANT: `Handle::current()` succeeds here because the consensus thread always runs
+        // inside the tokio runtime context (`rt_handle.enter()` in `raft/mod.rs`).
         let rt_handle = tokio::runtime::Handle::current();
         sync_network::spawn_peer(rt_handle, executor, &prog.target)
     }
