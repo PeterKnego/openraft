@@ -73,6 +73,8 @@ use crate::base::BoxStream;
 use crate::base::OptionalSend;
 use crate::core::SharedReplicateBatch;
 use crate::core::VendedReader;
+use crate::core::sync_input;
+use crate::core::sync_input::InputProducer;
 use crate::core::heartbeat::event::HeartbeatEvent;
 use crate::core::notification::Notification;
 use crate::core::sm::handle::SnapshotReader;
@@ -280,7 +282,9 @@ where C: RaftTypeConfig
     target: C::NodeId,
     leader_vote: CommittedVoteOf<C>,
     stream_id: StreamId,
-    tx_notify: MpscSenderOf<C, Notification<C>>,
+    /// Disruptor input-ring producer (3c.2). Each per-peer ack is published here instead of
+    /// the tokio mpsc `tx_notification`; the consensus loop drains the ring each iteration.
+    producer: InputProducer<C>,
 
     /// The last log id known to match on the follower (`ReplicationProgress::remote_matched`).
     remote_matched: Option<LogIdOf<C>>,
@@ -309,7 +313,7 @@ where C: RaftTypeConfig
             let append_res = match rpc_res {
                 Ok(stream_append_res) => stream_append_res,
                 Err(rpc_err) => {
-                    self.send_progress_error(rpc_err, "stream-replication").await;
+                    self.send_progress_error(rpc_err, "stream-replication");
                     return Err("RPCError");
                 }
             };
@@ -319,27 +323,27 @@ where C: RaftTypeConfig
                     let last_acked_sending_time = inflight_queue.drain_acked(&matching);
 
                     if let Some(last) = last_acked_sending_time {
-                        self.notify_heartbeat_progress(last).await;
+                        self.notify_heartbeat_progress(last);
                     }
 
                     self.remote_matched = matching.clone();
 
-                    self.notify_progress(ReplicationResult(Ok(matching))).await;
+                    self.notify_progress(ReplicationResult(Ok(matching)));
                 }
                 Err(append_err) => {
                     match append_err {
                         StreamAppendError::Conflict(conflict_log_id) => {
-                            self.notify_progress(ReplicationResult(Err(conflict_log_id))).await;
+                            self.notify_progress(ReplicationResult(Err(conflict_log_id)));
                         }
                         StreamAppendError::HigherVote(higher) => {
-                            self.tx_notify
-                                .send(Notification::HigherVote {
+                            sync_input::publish_notification(
+                                &mut self.producer,
+                                Notification::HigherVote {
                                     target: self.target.clone(),
                                     higher,
                                     leader_vote: self.leader_vote.clone(),
-                                })
-                                .await
-                                .ok();
+                                },
+                            );
                         }
                     }
 
@@ -352,42 +356,42 @@ where C: RaftTypeConfig
 
     /// Port of `ReplicationCore::send_progress_error`: report an RPC error to the engine,
     /// but only when a payload is in flight (`inflight_id.is_some()`).
-    async fn send_progress_error(&mut self, err: RPCError<C>, when: impl fmt::Display) {
+    fn send_progress_error(&mut self, err: RPCError<C>, when: impl fmt::Display) {
         tracing::warn!("peer executor recv RPCError: {}, when:({})", err, when);
 
         // No inflight id ⇒ no payload was sent and nobody is waiting, no need to report.
         if self.inflight_id.is_none() {
             return;
         }
-        self.tx_notify
-            .send(Notification::ReplicationProgress {
+        sync_input::publish_notification(
+            &mut self.producer,
+            Notification::ReplicationProgress {
                 progress: Progress {
                     target: self.target.clone(),
                     result: Err(err.to_string()),
                 },
                 inflight_id: self.inflight_id,
-            })
-            .await
-            .ok();
+            },
+        );
     }
 
     /// Port of `ReplicationCore::notify_heartbeat_progress`: a successful replication round-trip
     /// implies a successful heartbeat.
-    async fn notify_heartbeat_progress(&mut self, sending_time: InstantOf<C>) {
-        self.tx_notify
-            .send(Notification::HeartbeatProgress {
+    fn notify_heartbeat_progress(&mut self, sending_time: InstantOf<C>) {
+        sync_input::publish_notification(
+            &mut self.producer,
+            Notification::HeartbeatProgress {
                 stream_id: self.stream_id,
                 target: self.target.clone(),
                 sending_time,
-            })
-            .await
-            .ok();
+            },
+        );
     }
 
     /// Port of `ReplicationCore::notify_progress`: emit a `ReplicationProgress` for a match or
     /// conflict. Crucially, a successful match with `matching.is_none()` emits **nothing**; a
     /// conflict always emits (even with `inflight_id == None`).
-    async fn notify_progress(&mut self, replication_result: ReplicationResult<C>) {
+    fn notify_progress(&mut self, replication_result: ReplicationResult<C>) {
         match &replication_result.0 {
             Ok(matching) => {
                 self.remote_matched = matching.clone();
@@ -404,36 +408,36 @@ where C: RaftTypeConfig
 
         // Always send Conflict error back, even when the inflight id is None, so heartbeat can
         // detect log reversion.
-        self.tx_notify
-            .send(Notification::ReplicationProgress {
+        sync_input::publish_notification(
+            &mut self.producer,
+            Notification::ReplicationProgress {
                 progress: Progress {
                     target: self.target.clone(),
                     result: Ok(replication_result.clone()),
                 },
                 // If None, it is not a response to a request with payload.
                 inflight_id: self.inflight_id,
-            })
-            .await
-            .ok();
+            },
+        );
     }
 
     /// Port of `HeartbeatWorker::handle_stream_result`: turn one heartbeat round-trip result
     /// into the heartbeat ack contract.
-    async fn handle_heartbeat_result(&mut self, result: StreamAppendResult<C>, heartbeat: &HeartbeatEvent<C>) {
+    fn handle_heartbeat_result(&mut self, result: StreamAppendResult<C>, heartbeat: &HeartbeatEvent<C>) {
         match result {
             Ok(_) => {
-                self.send_heartbeat_progress(heartbeat).await;
+                self.send_heartbeat_progress(heartbeat);
             }
             Err(StreamAppendError::HigherVote(vote)) => {
                 tracing::debug!("seen a higher vote from {}; when:(sending heartbeat)", self.target);
-                self.tx_notify
-                    .send(Notification::HigherVote {
+                sync_input::publish_notification(
+                    &mut self.producer,
+                    Notification::HigherVote {
                         target: self.target.clone(),
                         higher: vote,
                         leader_vote: self.leader_vote.clone(),
-                    })
-                    .await
-                    .ok();
+                    },
+                );
                 // Higher vote means leadership is not granted; do not send HeartbeatProgress.
             }
             Err(StreamAppendError::Conflict(_conflict_log_id)) => {
@@ -441,30 +445,30 @@ where C: RaftTypeConfig
                 // safe unwrap(): a None never conflicts.
                 let conflict_log_id = heartbeat.matching.clone().unwrap();
 
-                self.tx_notify
-                    .send(Notification::ReplicationProgress {
+                sync_input::publish_notification(
+                    &mut self.producer,
+                    Notification::ReplicationProgress {
                         progress: Progress {
                             target: self.target.clone(),
                             result: Ok(ReplicationResult(Err(conflict_log_id))),
                         },
                         inflight_id: None,
-                    })
-                    .await
-                    .ok();
-                self.send_heartbeat_progress(heartbeat).await;
+                    },
+                );
+                self.send_heartbeat_progress(heartbeat);
             }
         }
     }
 
-    async fn send_heartbeat_progress(&mut self, heartbeat: &HeartbeatEvent<C>) {
-        self.tx_notify
-            .send(Notification::HeartbeatProgress {
+    fn send_heartbeat_progress(&mut self, heartbeat: &HeartbeatEvent<C>) {
+        sync_input::publish_notification(
+            &mut self.producer,
+            Notification::HeartbeatProgress {
                 stream_id: self.stream_id,
                 sending_time: heartbeat.time,
                 target: self.target.clone(),
-            })
-            .await
-            .ok();
+            },
+        );
     }
 
     // ---- Snapshot emits (port of `SnapshotTransmitter`) -----------------------------------
@@ -506,8 +510,8 @@ where C: RaftTypeConfig
             }));
         }
 
-        self.notify_heartbeat_progress(start_time).await;
-        self.notify_snapshot_progress(meta.last_log_id, inflight_id).await;
+        self.notify_heartbeat_progress(start_time);
+        self.notify_snapshot_progress(meta.last_log_id, inflight_id);
         Ok(())
     }
 
@@ -515,23 +519,23 @@ where C: RaftTypeConfig
     /// `ReplicationProgress`. Unlike [`notify_progress`](Self::notify_progress) (the replication
     /// path), this has **no** `matching.is_none()` guard and always carries `inflight_id =
     /// Some(id)` — a snapshot send always reports its matching to the engine.
-    async fn notify_snapshot_progress(&mut self, matching: Option<LogIdOf<C>>, inflight_id: InflightId) {
-        self.tx_notify
-            .send(Notification::ReplicationProgress {
+    fn notify_snapshot_progress(&mut self, matching: Option<LogIdOf<C>>, inflight_id: InflightId) {
+        sync_input::publish_notification(
+            &mut self.producer,
+            Notification::ReplicationProgress {
                 progress: Progress {
                     target: self.target.clone(),
                     result: Ok(ReplicationResult(Ok(matching))),
                 },
                 inflight_id: Some(inflight_id),
-            })
-            .await
-            .ok();
+            },
+        );
     }
 
     /// Port of `SnapshotTransmitter::stream_snapshot`'s terminal error match. `Closed` →
     /// silently stop; `HigherVote` → emit `HigherVote`, stop; `StorageError` → emit
     /// `StorageError` (fatal), stop; `RPCError` → hand back to the executor for backoff/retry.
-    async fn on_snapshot_error(&mut self, error: ReplicationError<C>) -> SnapshotErrAction<C> {
+    fn on_snapshot_error(&mut self, error: ReplicationError<C>) -> SnapshotErrAction<C> {
         match error {
             ReplicationError::Closed(closed) => {
                 tracing::info!("snapshot transmission canceled: {}", closed);
@@ -539,19 +543,19 @@ where C: RaftTypeConfig
             }
             ReplicationError::HigherVote(h) => {
                 tracing::info!("snapshot transmission aborted, higher vote seen: {}", h);
-                self.tx_notify
-                    .send(Notification::HigherVote {
+                sync_input::publish_notification(
+                    &mut self.producer,
+                    Notification::HigherVote {
                         target: self.target.clone(),
                         higher: h.higher,
                         leader_vote: self.leader_vote.clone(),
-                    })
-                    .await
-                    .ok();
+                    },
+                );
                 SnapshotErrAction::Stop
             }
             ReplicationError::StorageError(error) => {
                 tracing::error!("error replication to target: {}, error: {}", self.target, error);
-                self.tx_notify.send(Notification::StorageError { error }).await.ok();
+                sync_input::publish_notification(&mut self.producer, Notification::StorageError { error });
                 SnapshotErrAction::Stop
             }
             ReplicationError::RPCError(err) => SnapshotErrAction::Rpc(err),
@@ -628,6 +632,7 @@ where
         stream_id: StreamId,
         config: Arc<Config>,
         tx_notify: MpscSenderOf<C, Notification<C>>,
+        producer: InputProducer<C>,
         network: N,
         log_reader: VendedReader<C, LS>,
         committed_rx: WatchReceiverOf<C, Option<LogIdOf<C>>>,
@@ -674,7 +679,7 @@ where
             target,
             leader_vote,
             stream_id,
-            tx_notify,
+            producer,
             remote_matched,
             inflight_id: None,
         };
@@ -829,7 +834,7 @@ where
                 Ok(resp_strm) => resp_strm,
                 Err(rpc_err) => {
                     self.backoff_state.on_error(rpc_err.backoff_rank());
-                    self.ack.send_progress_error(rpc_err, "initiate-stream-replication").await;
+                    self.ack.send_progress_error(rpc_err, "initiate-stream-replication");
                     // Engine resets inflight to None on the error notification and re-drives.
                     self.clear_pending();
                     break 'drive Ok(());
@@ -916,7 +921,7 @@ where
 
         match res {
             Ok(Ok(Some(stream_result))) => {
-                self.ack.handle_heartbeat_result(stream_result, &heartbeat).await;
+                self.ack.handle_heartbeat_result(stream_result, &heartbeat);
             }
             Ok(Ok(None)) => {
                 tracing::warn!("heartbeat stream to {} returned no response", self.ack.target);
@@ -955,7 +960,7 @@ where
 
             tracing::error!("ReplicationError while sending snapshot: {}", error);
 
-            let err = match self.ack.on_snapshot_error(error).await {
+            let err = match self.ack.on_snapshot_error(error) {
                 SnapshotErrAction::Stop => return,
                 SnapshotErrAction::Rpc(err) => err,
             };
@@ -1304,6 +1309,8 @@ mod tests {
     use super::NetEvent;
     use super::NetOp;
     use crate::core::sync_durability::block_on;
+    use crate::core::sync_input;
+    use crate::core::sync_input::InputPoller;
     use crate::engine::testing::UTConfig;
     use crate::progress::inflight_id::InflightId;
     use crate::replication::replicate::Replicate;
@@ -1384,25 +1391,37 @@ mod tests {
         Vote::new(1, 2).into_committed()
     }
 
-    fn new_emitter() -> (AckEmitter<TC>, crate::type_config::alias::MpscReceiverOf<TC, Noti>) {
-        let (tx, rx) = TC::mpsc::<Noti>(64);
+    fn new_emitter() -> (AckEmitter<TC>, InputPoller<TC>) {
+        let (poller, producer) = sync_input::build_input_ring::<TC>();
         let ack = AckEmitter::<TC> {
             target: 3,
             leader_vote: leader_vote(),
             stream_id: StreamId::new(7),
-            tx_notify: tx,
+            producer,
             remote_matched: None,
             inflight_id: None,
         };
-        (ack, rx)
+        (ack, poller)
     }
 
-    /// Drain all currently-queued notifications.
-    fn drain(rx: &mut crate::type_config::alias::MpscReceiverOf<TC, Noti>) -> Vec<Noti> {
-        use crate::async_runtime::MpscReceiver as _;
+    /// Drain all notifications currently visible on the input-ring poller. Polls until
+    /// `Polling::NoEvents` (no more published entries). Single-threaded: the producer has
+    /// already published everything by the time we drain, so all slots are immediately visible.
+    /// Used by all `AckEmitter` ack-contract tests (ring path).
+    fn drain(poller: &mut InputPoller<TC>) -> Vec<Noti> {
         let mut out = vec![];
-        while let Ok(n) = rx.try_recv() {
-            out.push(n);
+        loop {
+            match poller.poll() {
+                Ok(mut events) => {
+                    for e in &mut events {
+                        if let Some(n) = e.notify.lock().unwrap().take() {
+                            out.push(n);
+                        }
+                    }
+                }
+                Err(Polling::NoEvents) => break,
+                Err(Polling::Shutdown) => break,
+            }
         }
         out
     }
@@ -1417,7 +1436,7 @@ mod tests {
     /// `Ok(Ok(Some(matching)))` and `inflight_id = Some`.
     #[test]
     fn ack_contract_match() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         ack.inflight_id = Some(InflightId::new(1));
 
         let matching: Option<LogIdOf<TC>> = Some(log_id(1, 2, 5));
@@ -1429,7 +1448,7 @@ mod tests {
         let res = block_on(ack.handle_response_stream(resp_stream(vec![Ok(Ok(matching.clone()))]), q, &mut backoff));
         assert!(res.is_ok(), "stream exhausted normally");
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         // HeartbeatProgress first, then ReplicationProgress (network-response order).
         assert_eq!(notis.len(), 2, "expected HeartbeatProgress + ReplicationProgress, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::HeartbeatProgress { .. }), "first: {}", notis[0]);
@@ -1447,7 +1466,7 @@ mod tests {
     /// (the `matching.is_none()` guard), but still emits `HeartbeatProgress`.
     #[test]
     fn ack_contract_match_none_no_replication_progress() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         ack.inflight_id = Some(InflightId::new(1));
 
         let q = InflightAppendQueue::<TC>::new();
@@ -1457,7 +1476,7 @@ mod tests {
         let res = block_on(ack.handle_response_stream(resp_stream(vec![Ok(Ok(None))]), q, &mut backoff));
         assert!(res.is_ok());
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         assert_eq!(notis.len(), 1, "only HeartbeatProgress, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::HeartbeatProgress { .. }));
     }
@@ -1466,7 +1485,7 @@ mod tests {
     /// and the stream handler returns `Err("AppendError")`.
     #[test]
     fn ack_contract_conflict() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         ack.inflight_id = Some(InflightId::new(1));
 
         let conflict = log_id(1, 2, 9);
@@ -1480,7 +1499,7 @@ mod tests {
         ));
         assert_eq!(res, Err("AppendError"));
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         assert_eq!(notis.len(), 1, "only ReplicationProgress(conflict), got {:?}", names(&notis));
         match &notis[0] {
             Notification::ReplicationProgress { progress, .. } => {
@@ -1495,7 +1514,7 @@ mod tests {
     /// the stream handler returns `Err("RPCError")`.
     #[test]
     fn ack_contract_rpc_error_with_inflight() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         ack.inflight_id = Some(InflightId::new(2));
 
         let q = InflightAppendQueue::<TC>::new();
@@ -1504,7 +1523,7 @@ mod tests {
         let res = block_on(ack.handle_response_stream(resp_stream(vec![Err(err)]), q, &mut backoff));
         assert_eq!(res, Err("RPCError"));
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         assert_eq!(notis.len(), 1, "ReplicationProgress(err), got {:?}", names(&notis));
         match &notis[0] {
             Notification::ReplicationProgress { progress, inflight_id } => {
@@ -1518,7 +1537,7 @@ mod tests {
     /// (c') An RPC error with **no** inflight emits nothing (`send_progress_error` guard).
     #[test]
     fn ack_contract_rpc_error_no_inflight_emits_nothing() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         ack.inflight_id = None;
 
         let q = InflightAppendQueue::<TC>::new();
@@ -1527,22 +1546,22 @@ mod tests {
         let res = block_on(ack.handle_response_stream(resp_stream(vec![Err(err)]), q, &mut backoff));
         assert_eq!(res, Err("RPCError"));
 
-        assert!(drain(&mut rx).is_empty(), "no inflight ⇒ no progress notification");
+        assert!(drain(&mut poller).is_empty(), "no inflight ⇒ no progress notification");
     }
 
     /// (d) A successful heartbeat emits only `HeartbeatProgress` (no `ReplicationProgress`).
     #[test]
     fn ack_contract_heartbeat_success() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         let ev = HeartbeatEvent::<TC> {
             time: TC::now(),
             matching: Some(log_id(1, 2, 5)),
             cluster_committed: Some(log_id(1, 2, 5)),
         };
         let result: StreamAppendResult<TC> = Ok(Some(log_id(1, 2, 5)));
-        block_on(ack.handle_heartbeat_result(result, &ev));
+        ack.handle_heartbeat_result(result, &ev);
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         assert_eq!(notis.len(), 1, "only HeartbeatProgress, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::HeartbeatProgress { .. }));
     }
@@ -1551,7 +1570,7 @@ mod tests {
     /// `HeartbeatProgress`.
     #[test]
     fn ack_contract_heartbeat_conflict() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         let matching = log_id(1, 2, 5);
         let ev = HeartbeatEvent::<TC> {
             time: TC::now(),
@@ -1559,9 +1578,9 @@ mod tests {
             cluster_committed: Some(matching),
         };
         let result: StreamAppendResult<TC> = Err(StreamAppendError::Conflict(log_id(1, 2, 9)));
-        block_on(ack.handle_heartbeat_result(result, &ev));
+        ack.handle_heartbeat_result(result, &ev);
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         assert_eq!(notis.len(), 2, "ReplicationProgress(conflict) + HeartbeatProgress, got {:?}", names(&notis));
         match &notis[0] {
             Notification::ReplicationProgress { progress, inflight_id } => {
@@ -1576,7 +1595,7 @@ mod tests {
     /// (e) A heartbeat seeing a higher vote emits `HigherVote` and **no** `HeartbeatProgress`.
     #[test]
     fn ack_contract_heartbeat_higher_vote() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         let ev = HeartbeatEvent::<TC> {
             time: TC::now(),
             matching: Some(log_id(1, 2, 5)),
@@ -1584,9 +1603,9 @@ mod tests {
         };
         let higher = Vote::new(5, 9);
         let result: StreamAppendResult<TC> = Err(StreamAppendError::HigherVote(higher));
-        block_on(ack.handle_heartbeat_result(result, &ev));
+        ack.handle_heartbeat_result(result, &ev);
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         assert_eq!(notis.len(), 1, "only HigherVote, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::HigherVote { .. }));
     }
@@ -1657,7 +1676,7 @@ mod tests {
     /// `Ok(Ok(meta.last_log_id))` and `inflight_id = Some(id)`.
     #[test]
     fn ack_contract_snapshot_success() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         let id = InflightId::new(7);
         let last = Some(log_id(1, 2, 5));
 
@@ -1669,7 +1688,7 @@ mod tests {
         let res = block_on(ack.send_snapshot(&mut net, snapshot_with(last.clone()), id, never_cancel(), opt));
         assert!(res.is_ok(), "snapshot sent successfully");
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         assert_eq!(notis.len(), 2, "expected HeartbeatProgress + ReplicationProgress, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::HeartbeatProgress { .. }), "first: {}", notis[0]);
         match &notis[1] {
@@ -1686,7 +1705,7 @@ mod tests {
     /// `Err(HigherVote)`, and `on_snapshot_error` emits `HigherVote` (no progress).
     #[test]
     fn ack_contract_snapshot_higher_vote() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         let id = InflightId::new(7);
 
         let mut net = StubSnapNet {
@@ -1696,10 +1715,10 @@ mod tests {
         let res = block_on(ack.send_snapshot(&mut net, snapshot_with(Some(log_id(1, 2, 5))), id, never_cancel(), opt));
         let err = res.expect_err("higher vote → error");
 
-        let action = block_on(ack.on_snapshot_error(err));
+        let action = ack.on_snapshot_error(err);
         assert!(matches!(action, SnapshotErrAction::Stop), "higher vote stops the snapshot loop");
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         assert_eq!(notis.len(), 1, "only HigherVote, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::HigherVote { .. }), "got {}", notis[0]);
     }
@@ -1708,7 +1727,7 @@ mod tests {
     /// `on_snapshot_error` emits `StorageError` (fatal, no progress).
     #[test]
     fn ack_contract_snapshot_storage_error() {
-        let (mut ack, mut rx) = new_emitter();
+        let (mut ack, mut poller) = new_emitter();
         let id = InflightId::new(7);
 
         let sto_err = StorageError::<TC>::read_snapshot(None, TC::err_from_string("snap fail"));
@@ -1719,12 +1738,44 @@ mod tests {
         let res = block_on(ack.send_snapshot(&mut net, snapshot_with(Some(log_id(1, 2, 5))), id, never_cancel(), opt));
         let err = res.expect_err("storage error → error");
 
-        let action = block_on(ack.on_snapshot_error(err));
+        let action = ack.on_snapshot_error(err);
         assert!(matches!(action, SnapshotErrAction::Stop), "storage error stops the snapshot loop");
 
-        let notis = drain(&mut rx);
+        let notis = drain(&mut poller);
         assert_eq!(notis.len(), 1, "only StorageError, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::StorageError { .. }), "got {}", notis[0]);
+    }
+
+    // ---- AckEmitter→ring test (Task 2) --------------------------------------------------
+    //
+    // Pins that `AckEmitter` publishes to the disruptor input ring (not the tokio mpsc).
+    // Mirrors the ack-contract tests but asserts via the `EventPoller` instead of an mpsc
+    // receiver — RED before the field swap, GREEN after.
+
+    /// (ring-a) `AckEmitter` publishes `HeartbeatProgress` to the input ring; the `EventPoller`
+    /// drained on the test thread sees the notification.
+    #[test]
+    fn ack_emitter_publishes_to_ring() {
+        let (mut ack, mut poller) = new_emitter();
+
+        // Drive one ack-emit: a successful heartbeat emits `HeartbeatProgress`.
+        let ev = HeartbeatEvent::<TC> {
+            time: TC::now(),
+            matching: Some(log_id(1, 2, 5)),
+            cluster_committed: Some(log_id(1, 2, 5)),
+        };
+        let result: StreamAppendResult<TC> = Ok(Some(log_id(1, 2, 5)));
+        ack.handle_heartbeat_result(result, &ev);
+
+        // Drain the ring poller — the notification must arrive here, not on a tokio mpsc.
+        let notis = drain(&mut poller);
+        assert_eq!(notis.len(), 1, "AckEmitter→ring: expected exactly one HeartbeatProgress, got {:?}", names(&notis));
+        assert!(
+            matches!(notis[0], Notification::HeartbeatProgress { stream_id, target, .. }
+                if stream_id == StreamId::new(7) && target == 3),
+            "HeartbeatProgress carries the emitter's stream_id + target: {}",
+            notis[0]
+        );
     }
 
     // ---- Vote send-contract tests (Task 4) -----------------------------------------------
@@ -1765,6 +1816,17 @@ mod tests {
         }
     }
 
+    /// Drain all notifications from a tokio mpsc receiver (non-blocking). Used by the vote
+    /// send-contract tests: `send_vote_request` stays on `tx_notification` (async C::spawn path).
+    fn drain_mpsc(rx: &mut crate::type_config::alias::MpscReceiverOf<TC, Noti>) -> Vec<Noti> {
+        use crate::async_runtime::MpscReceiver as _;
+        let mut out = vec![];
+        while let Ok(n) = rx.try_recv() {
+            out.push(n);
+        }
+        out
+    }
+
     fn a_vote_req() -> VoteRequest<TC> {
         VoteRequest::new(Vote::new(2, 1), Some(log_id(1, 1, 3)))
     }
@@ -1797,7 +1859,7 @@ mod tests {
             tx,
         ));
 
-        let notis = drain(&mut rx);
+        let notis = drain_mpsc(&mut rx);
         assert_eq!(notis.len(), 1, "exactly one VoteResponse, got {:?}", names(&notis));
         match &notis[0] {
             Notification::VoteResponse { target, candidate_vote, .. } => {
@@ -1829,7 +1891,7 @@ mod tests {
             tx,
         ));
 
-        let notis = drain(&mut rx);
+        let notis = drain_mpsc(&mut rx);
         assert_eq!(notis.len(), 1, "exactly one PreVoteResponse, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::PreVoteResponse { .. }), "got {}", notis[0]);
     }
@@ -1851,6 +1913,6 @@ mod tests {
             tx,
         ));
 
-        assert!(drain(&mut rx).is_empty(), "transport failure ⇒ no vote notification");
+        assert!(drain_mpsc(&mut rx).is_empty(), "transport failure ⇒ no vote notification");
     }
 }

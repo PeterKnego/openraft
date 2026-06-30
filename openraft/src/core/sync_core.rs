@@ -120,10 +120,14 @@ where
     peers: PeerTable<C>,
 
     /// Consumer-side poller for the disruptor input ring (3c.2). Drained once per loop
-    /// iteration alongside `rx_notification`. As of Task 1 it carries only the durability
-    /// io-done (`LocalIO` / `StorageError`), published by the durability consumer / its
-    /// `IOFlushed` callback; Task 2 moves the network acks onto it too.
+    /// iteration alongside `rx_notification`. Carries io-done (Task 1) + network acks
+    /// (Task 2).
     input_poller: InputPoller<C>,
+
+    /// A cloned input-ring producer, kept on `SyncCore` so `spawn_peer_executor` can hand
+    /// each new peer consumer its own clone. After Task 2 every per-peer ack is published
+    /// here instead of `tx_notification`.
+    input_producer: InputProducer<C>,
 }
 
 impl<C, NF, LS, SM> SyncCore<C, NF, LS, SM>
@@ -140,6 +144,9 @@ where
         input_poller: InputPoller<C>,
         input_producer: InputProducer<C>,
     ) -> Self {
+        // Clone the producer before passing to the durability consumer so `spawn_peer_executor`
+        // can hand each new peer consumer its own clone (Task 2: network acks on ring).
+        let peer_producer = input_producer.clone();
         // The durability consumer becomes the sole owner of `log_store`. It gets a producer
         // clone so its `IOFlushed` callback can publish io-done directly to the input ring.
         let log_store = core.log_store.take().expect("log_store present at SyncCore construction");
@@ -149,6 +156,7 @@ where
             durability,
             peers: PeerTable::new(),
             input_poller,
+            input_producer: peer_producer,
         }
     }
 
@@ -677,7 +685,8 @@ where
             leader_vote,
             prog.progress.stream_id,
             self.core.config.clone(),
-            self.core.tx_notification.clone(),
+            self.core.tx_notification.clone(), // for ReplicationContext (stream-state StorageError)
+            self.input_producer.clone(),        // for AckEmitter (all 10 ack sites → ring)
             network,
             log_reader,
             self.core.committed_tx.subscribe(),
