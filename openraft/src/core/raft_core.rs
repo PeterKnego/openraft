@@ -1056,6 +1056,11 @@ where
     }
 
     /// Spawn a new replication stream returning its replication state handle.
+    ///
+    /// Under `sync-core`, replication runs on the per-peer network consumers
+    /// (`SyncCore::spawn_peer_executor` / `core::sync_network`), so this is unused there; the
+    /// feature-off `RaftCore` path still uses it.
+    #[cfg_attr(feature = "sync-core", allow(dead_code))]
     #[tracing::instrument(level = "debug", skip(self))]
     #[allow(clippy::type_complexity)]
     pub(crate) async fn spawn_replication_stream(
@@ -1431,6 +1436,9 @@ where
     /// partitioned peer — is **not** a grant, otherwise a fully isolated node would synthesize a
     /// quorum and inflate its term. A network that has not implemented `pre_vote` returns
     /// `Ok(granted)` from the default impl, keeping Pre-Vote a no-op during a rolling upgrade.
+    // Under `sync-core`, vote fan-out is owned by `SyncCore::spawn_parallel_vote_requests`
+    // (`core::sync_network::send_vote_request`); this is unused there, used by the feature-off path.
+    #[cfg_attr(feature = "sync-core", allow(dead_code))]
     #[tracing::instrument(level = "trace", skip_all)]
     async fn spawn_parallel_vote_requests(&mut self, vote_req: &VoteRequest<C>, kind: VoteRequestKind) {
         let members = self.engine.state.membership_state.effective().voter_ids();
@@ -1528,6 +1536,11 @@ where
     }
 
     /// Spawn parallel vote requests to all cluster members.
+    ///
+    /// Under `sync-core`, transfer-leader fan-out is owned by
+    /// `SyncCore::broadcast_transfer_leader` (`core::sync_network::send_transfer_leader_request`);
+    /// this is unused there, used by the feature-off path.
+    #[cfg_attr(feature = "sync-core", allow(dead_code))]
     #[tracing::instrument(level = "trace", skip_all)]
     async fn broadcast_transfer_leader(&mut self, req: TransferLeaderRequest<C>) {
         let voter_ids = self.engine.state.membership_state.effective().voter_ids();
@@ -2183,6 +2196,11 @@ where
     ///
     /// This method validates the session and sends heartbeat events only if the current
     /// session matches the requested session (no leader change or membership change).
+    ///
+    /// Under `sync-core`, heartbeat broadcast is owned by the `BroadcastHeartbeat` arm of
+    /// `SyncCore::run_command` (publishing `NetOp::Heartbeat` to each peer consumer); this is
+    /// unused there, used by the feature-off path.
+    #[cfg_attr(feature = "sync-core", allow(dead_code))]
     fn broadcast_heartbeat(&mut self, session_id: ReplicationSessionId<C>) {
         // Lazy get the progress data for heartbeat. If the leader changes or replication
         // config changes, no need to send heartbeat.

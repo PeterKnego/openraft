@@ -47,6 +47,8 @@
 //! `--features sync-core`.
 
 
+use std::time::Duration;
+
 use crate::async_runtime::MpscReceiver;
 use crate::async_runtime::TryRecvError;
 use crate::async_runtime::watch::WatchSender;
@@ -83,7 +85,6 @@ use crate::raft::VoteResponse;
 use crate::raft_state::io_state::io_id::IOId;
 use crate::raft_state::LogStateReader;
 use crate::rt::MpscSender;
-use crate::runtime::RaftRuntime;
 use crate::storage::RaftLogStorage;
 use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::OneshotReceiverOf;
@@ -333,25 +334,13 @@ where
         Ok(processed)
     }
 
-    /// Per-command execution. Phase 3b.1: the task-spawning/network commands are
-    /// delegated to `RaftCore::run_command` (Phase 3c relocates them); the
-    /// storage/apply/pure-sync commands are moved inline in later tasks. For now
-    /// everything delegates — this task just establishes SyncCore as the dispatch
-    /// point.
+    /// Per-command execution. As of Phase 3c.1 (Task 4), SyncCore owns **every** Engine command:
+    /// storage / apply / pure-sync commands execute inline; replication / heartbeat / snapshot are
+    /// routed to the per-peer network consumers; vote / transfer-leader fan out off the consensus
+    /// loop. There is no `RaftCore::run_command` delegation left.
     async fn run_command(&mut self, cmd: Command<C, SM>) -> Result<Option<Command<C, SM>>, StorageError<C>> {
-        // Task-spawning / network commands stay RaftCore's for now (Phase 3c).
-        // Use `matches!` (a transient borrow) rather than `match &cmd { .. => return
-        // self.core.run_command(cmd) }` — the latter moves `cmd` while the `&cmd`
-        // scrutinee borrow is still live, which does not compile.
-        let delegate = matches!(
-            &cmd,
-            Command::SendVote { .. } | Command::SendPreVote { .. } | Command::BroadcastTransferLeader { .. }
-        );
-        if delegate {
-            return self.core.run_command(cmd).await;
-        }
-
-        // Owned commands: condition gate + stats, then execute inline.
+        // SyncCore now owns every command — there is no `self.core.run_command` delegation left.
+        // Condition gate + stats, then execute inline.
         let condition = cmd.condition();
         if let Some(condition) = condition
             && !condition.is_met(&self.core.engine.state.io_state)
@@ -586,10 +575,21 @@ where
                 self.peers = new_peers;
             }
 
-            // All owned commands are explicit above; the remaining task-spawning commands
-            // (SendVote/SendPreVote/ReplicateSnapshot/BroadcastTransferLeader) returned via the
-            // by-ref delegate block at the top of run_command.
-            _ => unreachable!("delegated/handled commands are dispatched before this match arm"),
+            // ---- Phase 3c.1 (Task 4): vote / transfer-leader off-loop fan-out --------------
+            // Unlike replication, these broadcast to *all voters* during an election (when there
+            // are typically no peer consumers — you are a candidate, not a leader), so they fan out
+            // via a thin SyncCore-owned helper that `C::spawn`s one task per voter (off the
+            // consensus loop), faithfully mirroring `RaftCore::spawn_parallel_vote_requests` /
+            // `broadcast_transfer_leader`.
+            Command::SendVote { vote_req } => {
+                self.spawn_parallel_vote_requests(&vote_req, sync_network::VoteRequestKind::Vote).await;
+            }
+            Command::SendPreVote { vote_req } => {
+                self.spawn_parallel_vote_requests(&vote_req, sync_network::VoteRequestKind::PreVote).await;
+            }
+            Command::BroadcastTransferLeader { req } => {
+                self.broadcast_transfer_leader(req).await;
+            }
         }
         Ok(None)
     }
@@ -642,6 +642,78 @@ where
 
         let rt_handle = tokio::runtime::Handle::current();
         sync_network::spawn_peer(rt_handle, executor, &prog.target)
+    }
+
+    /// Fan out (pre-)vote requests to every other voter — the SyncCore-owned port of
+    /// `RaftCore::spawn_parallel_vote_requests`. Each voter's RPC + emit runs **off the consensus
+    /// loop** on its own `C::spawn`ed task (the consensus thread has entered the tokio runtime
+    /// context, so `C::spawn` has a runtime), so the election round does not serialize on this
+    /// loop. The per-voter body is [`sync_network::send_vote_request`], which emits the
+    /// `VoteResponse`/`PreVoteResponse` ack contract (nothing on a transport failure).
+    ///
+    /// Votes broadcast to all voters during an election, when there are typically no replication
+    /// peer consumers (you are a candidate, not a leader), so this does not reuse the peer table.
+    async fn spawn_parallel_vote_requests(
+        &mut self,
+        vote_req: &crate::raft::VoteRequest<C>,
+        kind: sync_network::VoteRequestKind,
+    ) {
+        let members = self.core.engine.state.membership_state.effective().voter_ids();
+        let ttl = Duration::from_millis(self.core.config.election_timeout_min);
+
+        for target in members {
+            if target == self.core.id {
+                continue;
+            }
+
+            let req = vote_req.clone();
+            // Safe unwrap(): target is a voter in the effective membership.
+            let target_node =
+                self.core.engine.state.membership_state.effective().get_node(&target).unwrap().clone();
+            let client = self.core.network_factory.new_client(target.clone(), &target_node).await;
+            let tx = self.core.tx_notification.clone();
+
+            // False positive lint (`non-binding let on a future`): rust-clippy#9932.
+            #[allow(clippy::let_underscore_future)]
+            let _ = C::spawn(sync_network::send_vote_request::<C, NF::Network>(
+                client,
+                target.clone(),
+                req,
+                kind,
+                ttl,
+                tx,
+            ));
+        }
+    }
+
+    /// Fan out a leadership-transfer request to every other voter — the SyncCore-owned port of
+    /// `RaftCore::broadcast_transfer_leader`. Like the vote fan-out, each RPC runs off the
+    /// consensus loop on a `C::spawn`ed task; the per-voter body is
+    /// [`sync_network::send_transfer_leader_request`] (no notification; failures logged).
+    async fn broadcast_transfer_leader(&mut self, req: crate::raft::message::TransferLeaderRequest<C>) {
+        let voter_ids = self.core.engine.state.membership_state.effective().voter_ids();
+        let ttl = Duration::from_millis(self.core.config.election_timeout_min);
+
+        for target in voter_ids {
+            if target == self.core.id {
+                continue;
+            }
+
+            let r = req.clone();
+            // Safe unwrap(): target is a voter in the effective membership.
+            let target_node =
+                self.core.engine.state.membership_state.effective().get_node(&target).unwrap().clone();
+            let client = self.core.network_factory.new_client(target.clone(), &target_node).await;
+
+            // False positive lint (`non-binding let on a future`): rust-clippy#9932.
+            #[allow(clippy::let_underscore_future)]
+            let _ = C::spawn(sync_network::send_transfer_leader_request::<C, NF::Network>(
+                client,
+                target.clone(),
+                r,
+                ttl,
+            ));
+        }
     }
 
     /// Mirrors `RaftCore::run_engine_commands`: drain and execute the Engine's

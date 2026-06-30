@@ -39,9 +39,6 @@
 //! ([`HeartbeatWorker`](crate::core::heartbeat::worker)). See those references for the exact
 //! conditions; the [`AckEmitter`] below is a faithful transcription.
 
-// A couple of NetOp variants (Vote / TransferLeader) stay delegated until Task 4, so remain
-// unconstructed here; keep the module-level allow rather than scattering per-item ones.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -89,6 +86,8 @@ use crate::network::Backoff;
 use crate::network::NetBackoff;
 use crate::network::NetSnapshot;
 use crate::network::NetStreamAppend;
+use crate::network::NetTransferLeader;
+use crate::network::NetVote;
 use crate::network::RPCOption;
 use crate::progress::inflight_id::InflightId;
 use crate::progress::stream_id::StreamId;
@@ -124,8 +123,11 @@ use crate::vote::raft_vote::RaftVoteExt;
 /// One network op routed to a per-peer consumer.
 ///
 /// `Replicate`, `Heartbeat` and `Snapshot` are published to the ring (the Replicate /
-/// BroadcastHeartbeat / ReplicateSnapshot arms). The remaining variants exist so the enum is
-/// forward-compatible with Task 4, which relocates the vote / transfer-leader arms.
+/// BroadcastHeartbeat / ReplicateSnapshot arms). Vote / transfer-leader are NOT routed here:
+/// they fan out to *all voters* during an election (when there are typically no replication-peer
+/// consumers yet, since you are a candidate, not a leader), so SyncCore drives them via a thin
+/// off-loop fan-out (`spawn_parallel_vote_requests` / `broadcast_transfer_leader`) using the
+/// per-voter [`send_vote_request`] / [`send_transfer_leader_request`] helpers below.
 pub(crate) enum NetOp<C>
 where C: RaftTypeConfig
 {
@@ -137,12 +139,6 @@ where C: RaftTypeConfig
 
     /// Transmit a snapshot to this peer.
     Snapshot { inflight_id: InflightId },
-
-    /// Send a (pre-)vote request to this peer. (Delegated until Task 4.)
-    Vote { req: VoteRequest<C> },
-
-    /// Forward a leadership-transfer request to this peer. (Delegated until Task 4.)
-    TransferLeader { req: TransferLeaderRequest<C> },
 }
 
 /// The disruptor ring slot for the network consumer.
@@ -720,10 +716,6 @@ where
             NetOp::Snapshot { inflight_id } => {
                 self.drive_snapshot(inflight_id).await;
             }
-            NetOp::Vote { .. } | NetOp::TransferLeader { .. } => {
-                // These arms stay delegated to RaftCore until Task 4 — never published here.
-                tracing::warn!("sync-net peer consumer received an unhandled NetOp variant (ignored)");
-            }
         }
     }
 
@@ -1081,6 +1073,126 @@ async fn take_stream_fatal_error<C>(
 where C: RaftTypeConfig {
     let mut fatal_error = fatal_error.lock().await;
     fatal_error.take()
+}
+
+/// Selects whether [`send_vote_request`] sends a real Vote or a Pre-Vote RPC (port of
+/// `RaftCore`'s private `VoteRequestKind`).
+#[derive(Clone, Copy)]
+pub(crate) enum VoteRequestKind {
+    Vote,
+    PreVote,
+}
+
+impl VoteRequestKind {
+    /// Lowercase label used in log messages: `"vote"` or `"pre-vote"`.
+    fn as_str(self) -> &'static str {
+        match self {
+            VoteRequestKind::Vote => "vote",
+            VoteRequestKind::PreVote => "pre-vote",
+        }
+    }
+}
+
+/// Send one (pre-)vote RPC to `target` and emit the response notification — the per-voter body of
+/// `RaftCore::spawn_parallel_vote_requests` (`raft_core.rs`), ported as a standalone, off-loop
+/// helper that `SyncCore::spawn_parallel_vote_requests` fans out via `C::spawn` (one task per
+/// voter). It owns nothing of the executor's generics, so it is unit-testable with a stub
+/// [`NetVote`].
+///
+/// Contract (faithful to the reference):
+///  - On `Ok(resp)`: emit `Notification::VoteResponse{target,resp,candidate_vote}` (or
+///    `PreVoteResponse` for [`VoteRequestKind::PreVote`]), where `candidate_vote` is the request's
+///    vote downgraded to non-committed.
+///  - On timeout or transport `Err`: emit **nothing**. A transport failure — including
+///    `Unreachable` from a genuinely partitioned peer — is **not** a grant; otherwise an isolated
+///    node could synthesize a quorum and inflate its term.
+pub(crate) async fn send_vote_request<C, N>(
+    mut client: N,
+    target: C::NodeId,
+    req: VoteRequest<C>,
+    kind: VoteRequestKind,
+    ttl: Duration,
+    tx_notify: MpscSenderOf<C, Notification<C>>,
+) where
+    C: RaftTypeConfig,
+    N: NetVote<C>,
+{
+    let vote = req.vote.clone();
+    let option = RPCOption::new(ttl);
+
+    let tm_res = match kind {
+        VoteRequestKind::Vote => C::timeout(ttl, client.vote(req, option)).await,
+        VoteRequestKind::PreVote => C::timeout(ttl, client.pre_vote(req, option)).await,
+    };
+
+    let res = match tm_res {
+        Ok(res) => res,
+        Err(_timeout) => {
+            tracing::error!("timeout while requesting {} from target {}", kind.as_str(), target);
+            return;
+        }
+    };
+
+    match res {
+        Ok(resp) => {
+            let candidate_vote = vote.into_non_committed();
+            let notification = match kind {
+                VoteRequestKind::Vote => Notification::VoteResponse {
+                    target,
+                    resp,
+                    candidate_vote,
+                },
+                VoteRequestKind::PreVote => Notification::PreVoteResponse {
+                    target,
+                    resp,
+                    candidate_vote,
+                },
+            };
+            tx_notify.send(notification).await.ok();
+        }
+        // A transport failure is not a grant: a partitioned peer must not count toward the
+        // (Pre-)Vote quorum (see the reference's note). A network without `pre_vote` returns
+        // `Ok(granted)` from the default impl, so Pre-Vote degrades to a no-op rather than relying
+        // on this branch.
+        Err(err) => {
+            tracing::error!("while requesting {}, error: {}, target: {}", kind.as_str(), err, target);
+        }
+    }
+}
+
+/// Send one leadership-transfer RPC to `target` — the per-voter body of
+/// `RaftCore::broadcast_transfer_leader`, ported as a standalone off-loop helper that
+/// `SyncCore::broadcast_transfer_leader` fans out via `C::spawn`. Emits no notification (the
+/// response is purely advisory; a transfer takes effect via the timeout-driven election the target
+/// triggers); failures are logged, like the reference.
+pub(crate) async fn send_transfer_leader_request<C, N>(
+    mut client: N,
+    target: C::NodeId,
+    req: TransferLeaderRequest<C>,
+    ttl: Duration,
+) where
+    C: RaftTypeConfig,
+    N: NetTransferLeader<C>,
+{
+    let option = RPCOption::new(ttl);
+
+    let tm_res = C::timeout(ttl, client.transfer_leader(req, option)).await;
+    let res = match tm_res {
+        Ok(res) => res,
+        Err(timeout) => {
+            tracing::error!("timeout sending transfer_leader: {}, target: {}", timeout, target);
+            return;
+        }
+    };
+
+    match res {
+        Err(e) => {
+            tracing::error!("error sending transfer_leader: {}, target: {}", e, target);
+        }
+        Ok(resp) => {
+            tracing::info!("Done transfer_leader sent to {}, resp: {:?}", target, resp);
+        }
+    }
 }
 
 /// Spawn the per-peer busy-spin network consumer, transferring ownership of `executor` to it.
@@ -1613,5 +1725,132 @@ mod tests {
         let notis = drain(&mut rx);
         assert_eq!(notis.len(), 1, "only StorageError, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::StorageError { .. }), "got {}", notis[0]);
+    }
+
+    // ---- Vote send-contract tests (Task 4) -----------------------------------------------
+    //
+    // These pin the per-voter vote-send + emit contract ported from
+    // `RaftCore::spawn_parallel_vote_requests`:
+    //  - `Ok(resp)` → `Notification::VoteResponse{target,resp,candidate_vote}` (or
+    //    `PreVoteResponse` for the pre-vote kind);
+    //  - a transport `Err` → **no** notification (a partitioned peer must not count as a grant).
+    // They exercise `send_vote_request` with a stubbed `NetVote::vote` / `pre_vote`.
+
+    use super::VoteRequestKind;
+    use super::send_vote_request;
+    use crate::network::NetVote;
+    use crate::raft::VoteRequest;
+    use crate::raft::VoteResponse;
+
+    /// A stub `NetVote` whose `vote` / `pre_vote` return one canned response.
+    struct StubVoteNet {
+        resp: Option<Result<VoteResponse<TC>, RPCError<TC>>>,
+    }
+
+    impl NetVote<TC> for StubVoteNet {
+        async fn vote(
+            &mut self,
+            _rpc: VoteRequest<TC>,
+            _option: RPCOption,
+        ) -> Result<VoteResponse<TC>, RPCError<TC>> {
+            self.resp.take().expect("vote called once")
+        }
+
+        async fn pre_vote(
+            &mut self,
+            _rpc: VoteRequest<TC>,
+            _option: RPCOption,
+        ) -> Result<VoteResponse<TC>, RPCError<TC>> {
+            self.resp.take().expect("pre_vote called once")
+        }
+    }
+
+    fn a_vote_req() -> VoteRequest<TC> {
+        VoteRequest::new(Vote::new(2, 1), Some(log_id(1, 1, 3)))
+    }
+
+    /// Drive a future under the reactor-free [`block_on`], but within a tokio runtime *context* so
+    /// the `C::timeout` the helper uses finds a timer driver (the stub resolves immediately, so the
+    /// timer never actually fires — this just mirrors the real consumer thread, which enters the
+    /// runtime context via `spawn_peer`).
+    fn block_on_in_rt<F: std::future::Future>(fut: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let _enter = rt.enter();
+        block_on(fut)
+    }
+
+    /// (vote-a) A granted vote response → exactly one `Notification::VoteResponse` carrying the
+    /// target, the response, and the request's vote as the (non-committed) candidate vote.
+    #[test]
+    fn vote_contract_response_emitted() {
+        let (tx, mut rx) = TC::mpsc::<Noti>(64);
+
+        let resp = VoteResponse::new(Vote::new(2, 1), Some(log_id(1, 1, 3)), true);
+        let net = StubVoteNet { resp: Some(Ok(resp)) };
+
+        block_on_in_rt(send_vote_request::<TC, _>(
+            net,
+            3, // target
+            a_vote_req(),
+            VoteRequestKind::Vote,
+            Duration::from_millis(1000),
+            tx,
+        ));
+
+        let notis = drain(&mut rx);
+        assert_eq!(notis.len(), 1, "exactly one VoteResponse, got {:?}", names(&notis));
+        match &notis[0] {
+            Notification::VoteResponse { target, candidate_vote, .. } => {
+                assert_eq!(*target, 3, "VoteResponse carries the target");
+                assert_eq!(
+                    *candidate_vote,
+                    Vote::new(2, 1).into_non_committed(),
+                    "candidate_vote == the request's vote (non-committed)"
+                );
+            }
+            other => panic!("expected VoteResponse, got {}", other),
+        }
+    }
+
+    /// (vote-a') A pre-vote granted response → `Notification::PreVoteResponse`.
+    #[test]
+    fn pre_vote_contract_response_emitted() {
+        let (tx, mut rx) = TC::mpsc::<Noti>(64);
+
+        let resp = VoteResponse::new(Vote::new(2, 1), Some(log_id(1, 1, 3)), true);
+        let net = StubVoteNet { resp: Some(Ok(resp)) };
+
+        block_on_in_rt(send_vote_request::<TC, _>(
+            net,
+            3,
+            a_vote_req(),
+            VoteRequestKind::PreVote,
+            Duration::from_millis(1000),
+            tx,
+        ));
+
+        let notis = drain(&mut rx);
+        assert_eq!(notis.len(), 1, "exactly one PreVoteResponse, got {:?}", names(&notis));
+        assert!(matches!(notis[0], Notification::PreVoteResponse { .. }), "got {}", notis[0]);
+    }
+
+    /// (vote-b) A transport error → **no** notification (a partitioned peer is not a grant).
+    #[test]
+    fn vote_contract_transport_error_emits_nothing() {
+        let (tx, mut rx) = TC::mpsc::<Noti>(64);
+
+        let err = RPCError::Unreachable(Unreachable::<TC>::from_string("partitioned"));
+        let net = StubVoteNet { resp: Some(Err(err)) };
+
+        block_on_in_rt(send_vote_request::<TC, _>(
+            net,
+            3,
+            a_vote_req(),
+            VoteRequestKind::Vote,
+            Duration::from_millis(1000),
+            tx,
+        ));
+
+        assert!(drain(&mut rx).is_empty(), "transport failure ⇒ no vote notification");
     }
 }
