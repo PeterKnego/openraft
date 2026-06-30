@@ -711,22 +711,27 @@ where
 
         // Take the network local (see `drive_replicate`) so the RPC borrow doesn't tie up `self`.
         let mut network = self.network.take().expect("network present until executor drop");
-        let res: Result<Option<StreamAppendResult<C>>, RPCError<C>> = async {
+        // Mirror HeartbeatWorker::do_run: wrap in C::timeout so an unreachable peer cannot
+        // block this consumer indefinitely (a hung stream_append would park the thread in
+        // block_on_yielding, preventing all ring ops and shutdown from being processed).
+        let res = C::timeout(timeout, async {
             let mut output = network.stream_append(input_stream, option).await?;
             output.next().await.transpose()
-        }
+        })
         .await;
         self.network = Some(network);
 
+        tracing::debug!("peer {} sent heartbeat: result: {:?}", self.ack.target, res);
+
         match res {
-            Ok(Some(stream_result)) => {
+            Ok(Ok(Some(stream_result))) => {
                 self.ack.handle_heartbeat_result(stream_result, &heartbeat).await;
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 tracing::warn!("heartbeat stream to {} returned no response", self.ack.target);
             }
-            Err(e) => {
-                tracing::warn!("failed to send heartbeat to {}: {}", self.ack.target, e);
+            other => {
+                tracing::warn!("failed to send heartbeat to {} (timeout or error): {:?}", self.ack.target, other);
             }
         }
     }
