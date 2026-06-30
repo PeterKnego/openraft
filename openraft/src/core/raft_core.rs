@@ -235,6 +235,11 @@ where
 
     /// A Watch channel sender for IO completion notifications from storage callbacks.
     /// This is used by IOFlushed callbacks to report IO completion in a synchronous manner.
+    ///
+    /// Not present under `sync-core`: the synchronous consensus loop's durability consumer
+    /// publishes io-done directly to the input ring (`core::sync_input`), so neither this watch
+    /// sender nor the `io_completion_forwarder` task exist (3c.2).
+    #[cfg(not(feature = "sync-core"))]
     pub(crate) tx_io_completed: WatchSenderOf<C, Result<IOId<C>, StorageError<C>>>,
 
     /// Broadcasts I/O acceptance before submission to storage.

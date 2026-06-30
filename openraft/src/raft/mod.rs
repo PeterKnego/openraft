@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use core_state::CoreState;
 use derive_more::Display;
+#[cfg(not(feature = "sync-core"))]
 use futures_util::FutureExt;
 use linearizable_read::Linearizer;
 pub use message::AppendEntriesRequest;
@@ -70,6 +71,7 @@ use crate::OptionalSend;
 use crate::RaftNetworkFactory;
 use crate::RaftState;
 pub use crate::RaftTypeConfig;
+#[cfg(not(feature = "sync-core"))]
 use crate::StorageError;
 use crate::StorageHelper;
 use crate::async_runtime::MpscWeakSender;
@@ -95,6 +97,7 @@ use crate::core::io_flush_tracking::LogProgress;
 use crate::core::io_flush_tracking::SnapshotProgress;
 use crate::core::io_flush_tracking::VoteProgress;
 use crate::core::merged_raft_msg_receiver::BatchRaftMsgReceiver;
+#[cfg(not(feature = "sync-core"))]
 use crate::core::notification::Notification;
 use crate::core::raft_msg::RaftMsg;
 use crate::core::raft_msg::external_command::ExternalCommand;
@@ -136,6 +139,7 @@ use crate::type_config::alias::WatchReceiverOf;
 use crate::type_config::alias::WriteResponderOf;
 use crate::vote::Vote;
 use crate::vote::leader_id::raft_leader_id::RaftLeaderId;
+#[cfg(not(feature = "sync-core"))]
 use crate::vote::leader_id::raft_leader_id::RaftLeaderIdExt;
 use crate::vote::non_committed::UncommittedVote;
 use crate::vote::raft_vote::RaftVote;
@@ -356,6 +360,11 @@ where C: RaftTypeConfig
 /// To reduce wakeup overhead, notifications are batched: at most one notification
 /// is forwarded per `BATCH_INTERVAL`. When a change arrives, the forwarder waits
 /// until the interval expires before reading and forwarding the latest value.
+///
+/// Not used under the `sync-core` feature: the synchronous consensus loop's durability
+/// consumer publishes io-done (`LocalIO`/`StorageError`) directly to the input ring
+/// (`core::sync_input`), so this watch-channel bridge task is not spawned (3c.2).
+#[cfg(not(feature = "sync-core"))]
 async fn io_completion_forwarder<C>(
     mut rx_io: WatchReceiverOf<C, Result<IOId<C>, StorageError<C>>>,
     weak_tx_notify: MpscWeakSenderOf<C, Notification<C>>,
@@ -466,11 +475,18 @@ where
 
         // Watch channel for IO completion notifications from storage callbacks.
         // Initial value is a dummy IOId with this node's ID.
-        let leader_id = C::LeaderId::new_with_default_term(id.clone());
-        let dummy_io_id = IOId::Vote(UncommittedVote::new(leader_id));
-        let (tx_io_completed, rx_io_completed) = C::watch_channel(Ok(dummy_io_id));
+        // Watch channel for IO completion notifications from storage callbacks (default async
+        // path only). Under `sync-core` io-done flows via the input ring (`core::sync_input`), so
+        // neither this channel, the `RaftCore::tx_io_completed` field, nor the forwarder exist.
+        #[cfg(not(feature = "sync-core"))]
+        let (tx_io_completed, rx_io_completed) = {
+            let leader_id = C::LeaderId::new_with_default_term(id.clone());
+            let dummy_io_id = IOId::Vote(UncommittedVote::new(leader_id));
+            C::watch_channel(Ok(dummy_io_id))
+        };
 
-        // Create weak sender for forwarder before moving tx_notify into RaftCore
+        // Create weak sender for forwarder before moving tx_notify into RaftCore (default path only).
+        #[cfg(not(feature = "sync-core"))]
         let weak_tx_notify = tx_notify.downgrade();
 
         let (tx_progress, progress_watcher) = IoProgressWatcher::new();
@@ -572,6 +588,7 @@ where
             tx_notification: tx_notify,
             rx_notification: rx_notify,
 
+            #[cfg(not(feature = "sync-core"))]
             tx_io_completed,
 
             io_accepted_tx,
@@ -592,7 +609,9 @@ where
             span: core_span,
         };
 
-        // Spawn forwarder task to bridge Watch channel to notification channel
+        // Spawn forwarder task to bridge Watch channel to notification channel (default path only;
+        // under sync-core io-done flows via the input ring — no forwarder).
+        #[cfg(not(feature = "sync-core"))]
         let _forwarder_handle = C::spawn(io_completion_forwarder::<C>(rx_io_completed, weak_tx_notify));
 
         StepDownWatcher::<C>::spawn(
@@ -613,7 +632,12 @@ where
             // drive need a runtime to run on. The thread reports its terminal result over a
             // oneshot; a thin tokio task awaits it so `CoreState::Running` keeps its expected
             // `C::JoinHandle` type.
-            let sync_core = crate::core::SyncCore::new(core, log_reader_request_rx, readable_tx);
+            // Disruptor input ring (3c.2): the consensus loop drains the poller each iteration;
+            // the durability consumer + its `IOFlushed` callback publish io-done to a producer
+            // clone. Network acks still go via `tx_notification` until Task 2.
+            let (input_poller, input_producer) = crate::core::sync_input::build_input_ring::<C>();
+            let sync_core =
+                crate::core::SyncCore::new(core, log_reader_request_rx, readable_tx, input_poller, input_producer);
             let rt_handle = tokio::runtime::Handle::current();
             let (tx_done, rx_done) = C::oneshot();
             std::thread::Builder::new()

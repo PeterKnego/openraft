@@ -34,6 +34,24 @@ where C: RaftTypeConfig
     /// This is used when only completion notification is needed without log ID
     /// or other detailed information. It propagates the IO result (success or error).
     Signal(OneshotSenderOf<C, Result<(), io::Error>>),
+
+    /// sync-core: run a closure on completion, mapping the io result (with the captured
+    /// `io_id`) to `Ok(io_id)` / `Err(storage_error)` and handing it to `on_done`. The
+    /// synchronous consensus loop's durability consumer uses this to publish io-done
+    /// (`LocalIO` / `StorageError`) directly to the input ring, replacing the watch-channel
+    /// `Notify` + forwarder-task path.
+    #[cfg(feature = "sync-core")]
+    RingNotify(IOFlushedRingNotify<C>),
+}
+
+/// Inner struct holding the data for [`IOFlushed::RingNotify`]. Private fields keep the
+/// pub(crate)-only [`IOId`] / closure out of the public API (mirrors [`IOFlushedNotify`]).
+#[cfg(feature = "sync-core")]
+pub struct IOFlushedRingNotify<C>
+where C: RaftTypeConfig
+{
+    io_id: IOId<C>,
+    on_done: Box<dyn FnOnce(Result<IOId<C>, StorageError<C>>) + Send>,
 }
 
 /// Inner struct holding the notification data for [`IOFlushed::Notify`].
@@ -66,6 +84,17 @@ where C: RaftTypeConfig
 
     pub(crate) fn new(io_id: IOId<C>, tx: WatchSenderOf<C, Result<IOId<C>, StorageError<C>>>) -> Self {
         Self::Notify(IOFlushedNotify { io_id, tx })
+    }
+
+    /// sync-core: build a callback that runs `on_done` with the completion result
+    /// (`Ok(io_id)` / `Err(storage_error)`), used by the durability consumer to publish io-done
+    /// directly to the input ring (no watch channel / forwarder task).
+    #[cfg(feature = "sync-core")]
+    pub(crate) fn ring_notify(
+        io_id: IOId<C>,
+        on_done: Box<dyn FnOnce(Result<IOId<C>, StorageError<C>>) + Send>,
+    ) -> Self {
+        Self::RingNotify(IOFlushedRingNotify { io_id, on_done })
     }
 
     /// Report log io completion event (deprecated).
@@ -112,6 +141,17 @@ where C: RaftTypeConfig
                 if !modified {
                     tracing::debug!("IO completion not sent: channel state unchanged");
                 }
+            }
+            #[cfg(feature = "sync-core")]
+            Self::RingNotify(IOFlushedRingNotify { io_id, on_done }) => {
+                let value = match result {
+                    Err(e) => Err(Self::make_storage_error(&io_id, e)),
+                    Ok(_) => {
+                        tracing::debug!("{}: IOFlushed completed: {}", func_name!(), io_id);
+                        Ok(io_id)
+                    }
+                };
+                on_done(value);
             }
         }
     }

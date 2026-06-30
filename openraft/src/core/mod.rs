@@ -46,6 +46,8 @@ mod sync_core;
 #[cfg(feature = "sync-core")]
 mod sync_durability;
 #[cfg(feature = "sync-core")]
+pub(crate) mod sync_input;
+#[cfg(feature = "sync-core")]
 pub(crate) mod sync_network;
 mod tick;
 

@@ -14,8 +14,9 @@
 //!
 //! Write completion follows the IO-completion model:
 //!  - `Append` is **fire-and-forget** — its `IOFlushed` callback (fired by
-//!    `log_store.append`) drives the existing `tx_io_completed` → forwarder →
-//!    `Notification::LocalIO` path. No oneshot.
+//!    `log_store.append`) publishes `Notification::LocalIO` (or `StorageError`) **directly to
+//!    the consensus loop's input ring** (`sync_input`) via its own producer clone. No oneshot,
+//!    no watch channel, no forwarder task (3c.2).
 //!  - `SaveCommitted` is **fire-and-forget** — it is optional/advisory (trait default
 //!    no-op; openraft tolerates a lagging committed marker); errors are logged, not
 //!    propagated. Apply does not depend on it being durable; FIFO consumer order keeps
@@ -61,6 +62,9 @@ use disruptor::build_single_producer;
 use crate::RaftTypeConfig;
 use crate::StorageError;
 use crate::async_runtime::WatchSender;
+use crate::core::notification::Notification;
+use crate::core::sync_input;
+use crate::core::sync_input::InputProducer;
 use crate::async_runtime::watch::WatchReceiver;
 use crate::base::OptionalSend;
 use crate::errors::StorageIOResult;
@@ -235,9 +239,10 @@ where
 /// One storage write op routed to the consumer.
 ///
 /// `Append` and `SaveCommitted` are **fire-and-forget**: the consensus loop publishes them
-/// and returns immediately. `Append` flush completion flows via the `IOFlushed` callback →
-/// `tx_io_completed` → forwarder → `Notification::LocalIO`; readability for a later
-/// `Replicate` is preserved by the consumer's `readable` watermark + `GatedLogReader`.
+/// and returns immediately. `Append` flush completion flows via the `IOFlushed` callback,
+/// which publishes `Notification::LocalIO`/`StorageError` directly to the consensus loop's
+/// input ring (`sync_input`); readability for a later `Replicate` is preserved by the
+/// consumer's `readable` watermark + `GatedLogReader`.
 /// `SaveCommitted` is advisory (errors logged, not propagated). The other three ops
 /// (`SaveVote`, `Purge`, `Truncate`) carry a `done` oneshot the consumer signals once the
 /// storage call returns, so the consensus loop can run their after-work.
@@ -247,7 +252,6 @@ where C: RaftTypeConfig
     Append {
         entries: BatchOf<C, C::Entry>,
         io_id: IOId<C>,
-        tx_io_completed: WatchSenderOf<C, Result<IOId<C>, StorageError<C>>>,
     },
     SaveVote {
         vote: VoteOf<C>,
@@ -325,6 +329,7 @@ pub(crate) fn spawn<C, LS>(
     log_store: LS,
     reader_rx: mpsc::Receiver<ReaderRequest<C, LS>>,
     readable_tx: WatchSenderOf<C, Option<u64>>,
+    input_producer: InputProducer<C>,
 ) -> LogStoreHandle<C>
 where
     C: RaftTypeConfig,
@@ -343,7 +348,9 @@ where
     // there are always ≥1 receivers during startup.
     let readable_rx0 = readable_tx.subscribe();
 
-    let join = std::thread::spawn(move || consumer_loop::<C, LS>(log_store, poller, reader_rx, readable_tx, readable_rx0));
+    let join = std::thread::spawn(move || {
+        consumer_loop::<C, LS>(log_store, poller, reader_rx, readable_tx, readable_rx0, input_producer)
+    });
 
     LogStoreHandle {
         producer: Some(producer),
@@ -362,6 +369,7 @@ fn consumer_loop<C, LS>(
     reader_rx: mpsc::Receiver<ReaderRequest<C, LS>>,
     readable_tx: WatchSenderOf<C, Option<u64>>,
     _readable_rx0: WatchReceiverOf<C, Option<u64>>,
+    mut input_producer: InputProducer<C>,
 ) where
     C: RaftTypeConfig,
     LS: RaftLogStorage<C>,
@@ -400,7 +408,7 @@ fn consumer_loop<C, LS>(
                 for event in &mut events {
                     let taken = event.op.lock().unwrap().take();
                     if let Some(op) = taken {
-                        run_op(&mut log_store, op, &readable_tx);
+                        run_op(&mut log_store, op, &readable_tx, &mut input_producer);
                         did_work = true;
                     }
                 }
@@ -420,15 +428,34 @@ fn consumer_loop<C, LS>(
 
 /// Execute one write op against the (consumer-owned) `log_store`, reactor-free.
 /// Updates `readable_tx` after `Append` and `Truncate` so gated readers know the new watermark.
-fn run_op<C, LS>(log_store: &mut LS, op: DurabilityOp<C>, readable_tx: &WatchSenderOf<C, Option<u64>>)
-where
+fn run_op<C, LS>(
+    log_store: &mut LS,
+    op: DurabilityOp<C>,
+    readable_tx: &WatchSenderOf<C, Option<u64>>,
+    input_producer: &mut InputProducer<C>,
+) where
     C: RaftTypeConfig,
     LS: RaftLogStorage<C>,
 {
     match op {
-        DurabilityOp::Append { entries, io_id, tx_io_completed } => {
+        DurabilityOp::Append { entries, io_id } => {
             let last_idx = io_id.last_log_id().map(|l| l.index());
-            let callback = IOFlushed::new(io_id, tx_io_completed.clone());
+            // io-done flows straight to the consensus loop's input ring: the `IOFlushed`
+            // callback maps the result to `Ok(io_id)`/`Err(storage_error)` and publishes the
+            // matching `Notification` via its OWN producer clone. The callback may fire from a
+            // storage flush thread, so it must own the clone (`MultiProducer` is `Clone` /
+            // concurrent-safe). Replaces the old `tx_io_completed` watch + forwarder task.
+            let mut cb_producer = input_producer.clone();
+            let callback = IOFlushed::ring_notify(
+                io_id,
+                Box::new(move |res: Result<IOId<C>, StorageError<C>>| {
+                    let notify = match res {
+                        Ok(io_id) => Notification::LocalIO { io_id },
+                        Err(error) => Notification::StorageError { error },
+                    };
+                    sync_input::publish_notification(&mut cb_producer, notify);
+                }),
+            );
             match block_on(log_store.append(entries, callback)).sto_write_logs() {
                 Ok(()) => {
                     if let Some(idx) = last_idx {
@@ -437,10 +464,9 @@ where
                 }
                 Err(e) => {
                     // Submission failed ⇒ the flush callback will not fire; surface the storage
-                    // error through `tx_io_completed` so the forwarder turns it into a LocalIO
-                    // notification the engine handles as fatal (matches RaftCore's append?-to-Fatal).
-                    // raw send is fine: this only ever sets Err; the IOFlushed callback's send_if_modified upholds Err-permanence downstream.
-                    tx_io_completed.send(Err(e)).ok();
+                    // error straight to the input ring so the engine handles it as fatal (matches
+                    // RaftCore's append?-to-Fatal).
+                    sync_input::publish_notification(input_producer, Notification::StorageError { error: e });
                 }
             }
         }

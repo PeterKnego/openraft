@@ -63,6 +63,9 @@ use crate::core::sync_durability::block_on;
 use crate::core::sync_durability::DurabilityOp;
 use crate::core::sync_durability::LogStoreHandle;
 use crate::core::sync_durability::ReaderRequest;
+use crate::core::sync_input::InputPoller;
+use crate::core::sync_input::InputProducer;
+use disruptor::Polling;
 use crate::core::sync_network;
 use crate::core::sync_network::NetOp;
 use crate::core::sync_network::PeerExecutor;
@@ -115,6 +118,12 @@ where
     /// delegating to `RaftCore`'s tokio replication tasks. Dropping a handle joins its
     /// consumer thread.
     peers: PeerTable<C>,
+
+    /// Consumer-side poller for the disruptor input ring (3c.2). Drained once per loop
+    /// iteration alongside `rx_notification`. As of Task 1 it carries only the durability
+    /// io-done (`LocalIO` / `StorageError`), published by the durability consumer / its
+    /// `IOFlushed` callback; Task 2 moves the network acks onto it too.
+    input_poller: InputPoller<C>,
 }
 
 impl<C, NF, LS, SM> SyncCore<C, NF, LS, SM>
@@ -128,14 +137,18 @@ where
         mut core: RaftCore<C, NF, LS, SM>,
         reader_rx: std::sync::mpsc::Receiver<ReaderRequest<C, LS>>,
         readable_tx: WatchSenderOf<C, Option<u64>>,
+        input_poller: InputPoller<C>,
+        input_producer: InputProducer<C>,
     ) -> Self {
-        // The durability consumer becomes the sole owner of `log_store`.
+        // The durability consumer becomes the sole owner of `log_store`. It gets a producer
+        // clone so its `IOFlushed` callback can publish io-done directly to the input ring.
         let log_store = core.log_store.take().expect("log_store present at SyncCore construction");
-        let durability = sync_durability::spawn(log_store, reader_rx, readable_tx);
+        let durability = sync_durability::spawn(log_store, reader_rx, readable_tx, input_producer);
         Self {
             core,
             durability,
             peers: PeerTable::new(),
+            input_poller,
         }
     }
 
@@ -220,6 +233,10 @@ where
             // Drain channels one by one, bounded by the balancer's budgets. Both helpers
             // are non-blocking (`try_recv` internally) and return how many they processed.
             let raft_msg_processed = block_on(self.process_raft_msg(balancer.raft_msg()))?;
+            // Drain the disruptor input ring (3c.2): io-done (`LocalIO`/`StorageError`) published
+            // by the durability consumer. Same engine path as `process_notification`
+            // (`handle_notification` + `run_engine_commands`); `block_on`-wrapped at the call site.
+            let input_processed = block_on(self.process_input_ring(balancer.notification()))?;
             let notify_processed = block_on(self.process_notification(balancer.notification()))?;
 
             #[allow(clippy::collapsible_else_if)]
@@ -236,7 +253,7 @@ where
 
             // Reactor-free idle backoff: a fully idle iteration yields rather than pegging
             // the core (the durability consumer does the same). Latency tuning is later.
-            if raft_msg_processed == 0 && notify_processed == 0 {
+            if raft_msg_processed == 0 && notify_processed == 0 && input_processed == 0 {
                 std::thread::yield_now();
             }
         }
@@ -336,6 +353,38 @@ where
         Ok(processed)
     }
 
+    /// Drain the disruptor input ring (3c.2), feeding each `Notification` through the same engine
+    /// path `process_notification` uses (`handle_notification` + `run_engine_commands`). As of
+    /// Task 1 the ring carries only the durability io-done (`LocalIO` / `StorageError`); a broken
+    /// drain hangs every commit (the engine waits on `LocalIO`). Bounded by `at_most` so a hot ring
+    /// cannot starve the rest of the loop. Returns how many notifications it processed.
+    ///
+    /// `take(at_most)` lends a *bounded* batch of ready slots; on the [`EventGuard`] drop the ring
+    /// cursor advances to the END of the lent batch whether or not every slot was read, so we
+    /// **drain the whole returned batch** (the bound lives in `take`, NOT a mid-batch `break`) —
+    /// breaking early would silently drop the un-taken notifications. Each slot's `Notification` is
+    /// moved out of its `Mutex<Option<_>>`, handled, then the engine is run. `NoEvents`/`Shutdown`
+    /// mean nothing to do this iteration.
+    async fn process_input_ring(&mut self, at_most: u64) -> Result<u64, Fatal<C>> {
+        let mut processed = 0u64;
+
+        // Collect the batch's payloads first (the borrow of `self.input_poller` via the guard must
+        // end before we touch `self.core` in the handler loop).
+        let batch: Vec<Notification<C>> = match self.input_poller.take(at_most) {
+            Ok(mut events) => (&mut events).filter_map(|e| e.notify.lock().unwrap().take()).collect(),
+            Err(Polling::NoEvents) => return Ok(0),
+            Err(Polling::Shutdown) => return Ok(0),
+        };
+
+        for notify in batch {
+            self.core.handle_notification(notify)?;
+            processed += 1;
+            self.run_engine_commands().await?;
+        }
+
+        Ok(processed)
+    }
+
     /// Per-command execution. As of Phase 3c.1 (Task 4), SyncCore owns **every** Engine command:
     /// storage / apply / pure-sync commands execute inline; replication / heartbeat / snapshot are
     /// routed to the per-peer network consumers; vote / transfer-leader fan out off the consensus
@@ -379,15 +428,12 @@ where
                 self.core.engine.state.log_progress_mut().submit(io_id.clone());
                 self.core.runtime_stats.record_log_stage_now(Stage::Submitted, last_log_index + 1);
                 // Fire-and-forget: publish and return. Flush completion flows via the `IOFlushed`
-                // callback → `tx_io_completed` → forwarder → `Notification::LocalIO` → engine, as
-                // in RaftCore. Readability for a later (delegated) `Replicate` is preserved by the
-                // durability consumer's readable-watermark + `GatedLogReader` (no consensus-loop
-                // wait). Submission errors surface via `tx_io_completed` (see `run_op`).
-                self.durability.publish(DurabilityOp::Append {
-                    entries,
-                    io_id,
-                    tx_io_completed: self.core.tx_io_completed.clone(),
-                });
+                // callback, which publishes `Notification::LocalIO` directly to the input ring
+                // (`sync_input`) — drained by `process_input_ring` in the loop (3c.2). Readability
+                // for a later `Replicate` is preserved by the durability consumer's
+                // readable-watermark + `GatedLogReader` (no consensus-loop wait). Submission errors
+                // surface as `Notification::StorageError` on the same ring (see `run_op`).
+                self.durability.publish(DurabilityOp::Append { entries, io_id });
             }
             Command::SaveVote { vote } => {
                 let io_id = IOId::new(&vote);
