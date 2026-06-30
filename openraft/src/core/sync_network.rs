@@ -39,14 +39,19 @@
 //! ([`HeartbeatWorker`](crate::core::heartbeat::worker)). See those references for the exact
 //! conditions; the [`AckEmitter`] below is a faithful transcription.
 
-// A few NetOp variants (Snapshot / Vote / TransferLeader) stay delegated until Tasks 3-4, so
-// remain unconstructed here; keep the module-level allow rather than scattering per-item ones.
+// A couple of NetOp variants (Vote / TransferLeader) stay delegated until Task 4, so remain
+// unconstructed here; keep the module-level allow rather than scattering per-item ones.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::task::Poll;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -58,23 +63,31 @@ use disruptor::SingleConsumerBarrier;
 use disruptor::SingleProducer;
 use disruptor::SingleProducerBarrier;
 use disruptor::build_single_producer;
+use futures_util::FutureExt;
 use futures_util::StreamExt;
 
 use crate::Config;
 use crate::RaftTypeConfig;
+use crate::StorageError;
 use crate::async_runtime::Mutex as _;
 use crate::async_runtime::MpscSender as _;
 use crate::async_runtime::watch::WatchReceiver as _;
 use crate::base::BoxStream;
+use crate::base::OptionalSend;
 use crate::core::SharedReplicateBatch;
 use crate::core::VendedReader;
 use crate::core::heartbeat::event::HeartbeatEvent;
 use crate::core::notification::Notification;
+use crate::core::sm::handle::SnapshotReader;
 use crate::core::sync_durability::block_on_yielding;
+use crate::errors::HigherVote;
 use crate::errors::RPCError;
 use crate::errors::ReplicationClosed;
+use crate::errors::ReplicationError;
 use crate::log_id_range::LogIdRange;
+use crate::network::Backoff;
 use crate::network::NetBackoff;
+use crate::network::NetSnapshot;
 use crate::network::NetStreamAppend;
 use crate::network::RPCOption;
 use crate::progress::inflight_id::InflightId;
@@ -101,15 +114,18 @@ use crate::type_config::alias::InstantOf;
 use crate::type_config::alias::LogIdOf;
 use crate::type_config::alias::MpscSenderOf;
 use crate::type_config::alias::MutexOf;
+use crate::type_config::alias::SnapshotOf;
+use crate::type_config::alias::VoteOf;
 use crate::type_config::alias::WatchReceiverOf;
 use crate::type_config::alias::WatchSenderOf;
 use crate::vote::RaftVote;
+use crate::vote::raft_vote::RaftVoteExt;
 
 /// One network op routed to a per-peer consumer.
 ///
-/// In 3c.1 only `Replicate` and `Heartbeat` are published to the ring (the Replicate /
-/// BroadcastHeartbeat arms). The remaining variants exist so the enum is forward-compatible
-/// with Tasks 3-4, which relocate the vote / snapshot / transfer-leader arms.
+/// `Replicate`, `Heartbeat` and `Snapshot` are published to the ring (the Replicate /
+/// BroadcastHeartbeat / ReplicateSnapshot arms). The remaining variants exist so the enum is
+/// forward-compatible with Task 4, which relocates the vote / transfer-leader arms.
 pub(crate) enum NetOp<C>
 where C: RaftTypeConfig
 {
@@ -119,13 +135,13 @@ where C: RaftTypeConfig
     /// Send one heartbeat (zero-length AppendEntries) to this peer.
     Heartbeat { event: HeartbeatEvent<C> },
 
-    /// Transmit a snapshot to this peer. (Delegated until Tasks 3-4.)
+    /// Transmit a snapshot to this peer.
     Snapshot { inflight_id: InflightId },
 
-    /// Send a (pre-)vote request to this peer. (Delegated until Tasks 3-4.)
+    /// Send a (pre-)vote request to this peer. (Delegated until Task 4.)
     Vote { req: VoteRequest<C> },
 
-    /// Forward a leadership-transfer request to this peer. (Delegated until Tasks 3-4.)
+    /// Forward a leadership-transfer request to this peer. (Delegated until Task 4.)
     TransferLeader { req: TransferLeaderRequest<C> },
 }
 
@@ -140,6 +156,48 @@ where C: RaftTypeConfig
     op: Mutex<Option<NetOp<C>>>,
 }
 
+/// Cancel/replace signal shared between a peer's producer-side [`PeerConsumerHandle`] and the
+/// consumer-side [`PeerExecutor`]'s in-flight snapshot.
+///
+/// A snapshot send is the only op that can monopolise the consumer thread for a long time
+/// (the `full_snapshot` stream runs to completion under `block_on_yielding`), so while it runs
+/// the ring is not drained. The reference [`SnapshotTransmitter`](crate::replication::SnapshotTransmitter)
+/// runs in its own task and is cancelled via a `cancel_rx` watch that `RaftCore` signals on
+/// close/rebuild/replace. Here the equivalent is this shared cell:
+///  - `epoch` is bumped by [`PeerConsumerHandle::publish`] for every **replication-intent** op
+///    (`Replicate` / `Snapshot`) — a newer such op must preempt an in-flight snapshot (we
+///    cannot stream a snapshot and replicate at once). Heartbeats deliberately do NOT bump it;
+///    otherwise a heartbeat tick arriving mid-snapshot would perpetually cancel a slow snapshot.
+///  - `shutdown` is set by [`PeerConsumerHandle`]'s `Drop` so a leader stepping down / a
+///    membership rebuild aborts an in-flight snapshot promptly instead of blocking for its full
+///    duration.
+///
+/// The in-flight snapshot's `cancel` future ([`snapshot_cancel_future`]) — polled by the
+/// transport between chunks, exactly as `cancel_rx` is in the reference — fires when either the
+/// epoch advances past the value captured at snapshot start, or shutdown is set.
+#[derive(Default)]
+pub(crate) struct SnapshotCancel {
+    epoch: AtomicU64,
+    shutdown: AtomicBool,
+}
+
+/// Build the `cancel` future for an in-flight snapshot: it becomes `Ready` (cancel) once the
+/// shared `epoch` advances past `start_epoch` (a newer Replicate/Snapshot op was published) or
+/// `shutdown` is set (the peer handle was dropped). Reactor-free: it is polled by the transport's
+/// chunk loop, which `block_on_yielding` re-polls; no waker wiring needed.
+fn snapshot_cancel_future(
+    cancel: Arc<SnapshotCancel>,
+    start_epoch: u64,
+) -> impl Future<Output = ReplicationClosed> + OptionalSend + 'static {
+    futures_util::future::poll_fn(move |_cx| {
+        if cancel.shutdown.load(Ordering::Acquire) || cancel.epoch.load(Ordering::Acquire) != start_epoch {
+            Poll::Ready(ReplicationClosed::new("snapshot preempted by a newer op or shutdown"))
+        } else {
+            Poll::Pending
+        }
+    })
+}
+
 /// Per-peer producer handle, held by `SyncCore`'s `PeerTable`. Dropping it shuts the
 /// consumer thread down (producer drop → `Polling::Shutdown`) and joins it.
 pub(crate) struct PeerConsumerHandle<C>
@@ -149,6 +207,9 @@ where C: RaftTypeConfig
     /// the producer is what signals `Polling::Shutdown` to the consumer thread.
     producer: Option<SingleProducer<NetEvent<C>, SingleConsumerBarrier>>,
     join: Option<JoinHandle<()>>,
+
+    /// Shared cancel/replace signal for the consumer's in-flight snapshot (see [`SnapshotCancel`]).
+    snapshot_cancel: Arc<SnapshotCancel>,
 }
 
 impl<C> PeerConsumerHandle<C>
@@ -156,6 +217,14 @@ where C: RaftTypeConfig
 {
     /// Publish a network op to the peer consumer (FIFO; preserves send ordering).
     pub(crate) fn publish(&mut self, op: NetOp<C>) {
+        // A newer replication-intent op preempts an in-flight snapshot on the consumer (it
+        // cannot stream a snapshot and process the ring at once). Heartbeats do NOT preempt —
+        // see [`SnapshotCancel`]. The op that *starts* a snapshot (`Snapshot`) also bumps here,
+        // but `drive_snapshot` captures the epoch AFTER taking it from the ring, so it never
+        // self-cancels; only a strictly-later op trips the cancel future.
+        if matches!(op, NetOp::Replicate { .. } | NetOp::Snapshot { .. }) {
+            self.snapshot_cancel.epoch.fetch_add(1, Ordering::Release);
+        }
         let producer = self.producer.as_mut().expect("producer present until shutdown");
         producer.publish(move |slot| {
             // `slot` is `&mut NetEvent`; `get_mut` skips the (uncontended) lock.
@@ -168,6 +237,11 @@ impl<C> Drop for PeerConsumerHandle<C>
 where C: RaftTypeConfig
 {
     fn drop(&mut self) {
+        // Signal any in-flight snapshot to abort promptly (its `cancel` future observes this),
+        // so a stepped-down leader / membership rebuild does not block on a long snapshot. The
+        // append/heartbeat drives are already bounded (heartbeat via `C::timeout`); only the
+        // snapshot stream needs this explicit nudge.
+        self.snapshot_cancel.shutdown.store(true, Ordering::Release);
         // Drop the producer → the consumer observes `Polling::Shutdown` and exits on its next
         // loop iteration.
         self.producer.take();
@@ -186,6 +260,17 @@ where C: RaftTypeConfig
 
 /// Map from peer node-id to its consumer handle. Held by `SyncCore`.
 pub(crate) type PeerTable<C> = BTreeMap<<C as RaftTypeConfig>::NodeId, PeerConsumerHandle<C>>;
+
+/// Outcome of [`AckEmitter::on_snapshot_error`] — the port of `SnapshotTransmitter::stream_snapshot`'s
+/// terminal error match. `Stop` means the snapshot loop ends (already emitted the right
+/// notification, if any); `Rpc` carries an RPC error back to `drive_snapshot` for the
+/// backoff/retry handling (which needs the network + config, so stays on the executor).
+enum SnapshotErrAction<C>
+where C: RaftTypeConfig
+{
+    Stop,
+    Rpc(RPCError<C>),
+}
 
 /// The ack-emitting half of the per-peer executor.
 ///
@@ -385,13 +470,105 @@ where C: RaftTypeConfig
             .await
             .ok();
     }
+
+    // ---- Snapshot emits (port of `SnapshotTransmitter`) -----------------------------------
+
+    /// Port of `SnapshotTransmitter::send_snapshot`: transmit one full snapshot and, on
+    /// success, emit the snapshot ack contract — `HeartbeatProgress` (a successful round-trip
+    /// is also a heartbeat) then `ReplicationProgress{Ok(Ok(meta.last_log_id)), inflight_id =
+    /// Some(id)}`. A higher vote in the response returns `Err(HigherVote)` (no emits here — the
+    /// caller routes it through [`on_snapshot_error`](Self::on_snapshot_error)).
+    ///
+    /// `network` is taken as `&mut N` (the executor lends its `network` local) so this method
+    /// stays free of the executor's `LS`/`SM` generics and is unit-testable with a stub
+    /// `NetSnapshot`.
+    async fn send_snapshot<N>(
+        &mut self,
+        network: &mut N,
+        snapshot: SnapshotOf<C>,
+        inflight_id: InflightId,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        option: RPCOption,
+    ) -> Result<(), ReplicationError<C>>
+    where
+        N: NetSnapshot<C>,
+    {
+        let meta = snapshot.meta.clone();
+        let sender_vote: VoteOf<C> = self.leader_vote.clone().into_vote();
+
+        let start_time = C::now();
+
+        let resp = network.full_snapshot(sender_vote.clone(), snapshot, cancel, option).await?;
+
+        tracing::info!("finished sending full_snapshot, resp: {}", resp);
+
+        // Handle response conditions.
+        if resp.vote.as_ref_vote() > sender_vote.as_ref_vote() {
+            return Err(ReplicationError::HigherVote(HigherVote {
+                higher: resp.vote,
+                sender_vote,
+            }));
+        }
+
+        self.notify_heartbeat_progress(start_time).await;
+        self.notify_snapshot_progress(meta.last_log_id, inflight_id).await;
+        Ok(())
+    }
+
+    /// Port of `SnapshotTransmitter::notify_progress`: emit the post-snapshot
+    /// `ReplicationProgress`. Unlike [`notify_progress`](Self::notify_progress) (the replication
+    /// path), this has **no** `matching.is_none()` guard and always carries `inflight_id =
+    /// Some(id)` — a snapshot send always reports its matching to the engine.
+    async fn notify_snapshot_progress(&mut self, matching: Option<LogIdOf<C>>, inflight_id: InflightId) {
+        self.tx_notify
+            .send(Notification::ReplicationProgress {
+                progress: Progress {
+                    target: self.target.clone(),
+                    result: Ok(ReplicationResult(Ok(matching))),
+                },
+                inflight_id: Some(inflight_id),
+            })
+            .await
+            .ok();
+    }
+
+    /// Port of `SnapshotTransmitter::stream_snapshot`'s terminal error match. `Closed` →
+    /// silently stop; `HigherVote` → emit `HigherVote`, stop; `StorageError` → emit
+    /// `StorageError` (fatal), stop; `RPCError` → hand back to the executor for backoff/retry.
+    async fn on_snapshot_error(&mut self, error: ReplicationError<C>) -> SnapshotErrAction<C> {
+        match error {
+            ReplicationError::Closed(closed) => {
+                tracing::info!("snapshot transmission canceled: {}", closed);
+                SnapshotErrAction::Stop
+            }
+            ReplicationError::HigherVote(h) => {
+                tracing::info!("snapshot transmission aborted, higher vote seen: {}", h);
+                self.tx_notify
+                    .send(Notification::HigherVote {
+                        target: self.target.clone(),
+                        higher: h.higher,
+                        leader_vote: self.leader_vote.clone(),
+                    })
+                    .await
+                    .ok();
+                SnapshotErrAction::Stop
+            }
+            ReplicationError::StorageError(error) => {
+                tracing::error!("error replication to target: {}, error: {}", self.target, error);
+                self.tx_notify.send(Notification::StorageError { error }).await.ok();
+                SnapshotErrAction::Stop
+            }
+            ReplicationError::RPCError(err) => SnapshotErrAction::Rpc(err),
+        }
+    }
 }
 
-/// The per-peer executor: a reactor-free port of `ReplicationCore`'s append + heartbeat path.
-pub(crate) struct PeerExecutor<C, N, LS>
+/// The per-peer executor: a reactor-free port of `ReplicationCore`'s append + heartbeat path
+/// plus `SnapshotTransmitter`'s snapshot path.
+pub(crate) struct PeerExecutor<C, N, LS, SM>
 where
     C: RaftTypeConfig,
-    N: NetStreamAppend<C> + NetBackoff<C>,
+    N: NetStreamAppend<C> + NetBackoff<C> + NetSnapshot<C>,
     LS: RaftLogStorage<C>,
 {
     /// Ack-emitting state + the ported ack-contract methods.
@@ -422,6 +599,15 @@ where
 
     config: Arc<Config>,
 
+    /// Snapshot reader (handle to the state machine worker), used by the snapshot path to fetch
+    /// the current snapshot — the port of `SnapshotTransmitter::snapshot_reader`. Obtained from
+    /// `sm_handle.new_snapshot_reader()` when the peer executor is spawned.
+    snapshot_reader: SnapshotReader<C, SM>,
+
+    /// Shared cancel/replace signal for the in-flight snapshot (see [`SnapshotCancel`]). A clone
+    /// of the same `Arc` lives in this peer's [`PeerConsumerHandle`].
+    snapshot_cancel: Arc<SnapshotCancel>,
+
     /// Keep the cancel/replicate watch senders alive so the receivers held inside
     /// `stream_state` / `event_watcher` stay open (the LogsSince/backoff `select!` paths in
     /// `StreamState` borrow them, though the bounded port never blocks on them).
@@ -429,11 +615,12 @@ where
     _replicate_tx: WatchSenderOf<C, Replicate<C>>,
 }
 
-impl<C, N, LS> PeerExecutor<C, N, LS>
+impl<C, N, LS, SM> PeerExecutor<C, N, LS, SM>
 where
     C: RaftTypeConfig,
-    N: NetStreamAppend<C> + NetBackoff<C>,
+    N: NetStreamAppend<C> + NetBackoff<C> + NetSnapshot<C>,
     LS: RaftLogStorage<C>,
+    SM: 'static,
 {
     /// Build a peer executor. Called on the consensus thread (in `SyncCore::run_command`),
     /// then moved onto the per-peer consumer thread by [`spawn_peer`].
@@ -452,6 +639,7 @@ where
         io_submitted_rx: WatchReceiverOf<C, crate::raft_state::IOId<C>>,
         replicate_batch: SharedReplicateBatch,
         remote_matched: Option<LogIdOf<C>>,
+        snapshot_reader: SnapshotReader<C, SM>,
     ) -> Self {
         let (cancel_tx, cancel_rx) = C::watch_channel(());
         let (replicate_tx, replicate_rx) = C::watch_channel(Replicate::default());
@@ -504,9 +692,17 @@ where
             leader_committed: None,
             backoff_state,
             config,
+            snapshot_reader,
+            snapshot_cancel: Arc::new(SnapshotCancel::default()),
             _cancel_tx: cancel_tx,
             _replicate_tx: replicate_tx,
         }
+    }
+
+    /// A clone of this executor's snapshot cancel/replace signal, for the producer-side
+    /// [`PeerConsumerHandle`] to share (see [`SnapshotCancel`]).
+    fn snapshot_cancel(&self) -> Arc<SnapshotCancel> {
+        self.snapshot_cancel.clone()
     }
 
     /// Dispatch one ring op into the executor (mirrors `consumer_loop`'s `run_op`).
@@ -521,8 +717,11 @@ where
             NetOp::Heartbeat { event } => {
                 self.drive_heartbeat(event).await;
             }
-            NetOp::Snapshot { .. } | NetOp::Vote { .. } | NetOp::TransferLeader { .. } => {
-                // These arms stay delegated to RaftCore until Tasks 3-4 — never published here.
+            NetOp::Snapshot { inflight_id } => {
+                self.drive_snapshot(inflight_id).await;
+            }
+            NetOp::Vote { .. } | NetOp::TransferLeader { .. } => {
+                // These arms stay delegated to RaftCore until Task 4 — never published here.
                 tracing::warn!("sync-net peer consumer received an unhandled NetOp variant (ignored)");
             }
         }
@@ -736,6 +935,114 @@ where
         }
     }
 
+    /// Transmit a snapshot to this peer — the port of `SnapshotTransmitter::stream_snapshot`'s
+    /// retry loop. Runs on the peer consumer thread (so it serialises with this peer's
+    /// append/heartbeat drives, unlike the reference's separate task). Responsiveness to a newer
+    /// op / shutdown comes from the [`SnapshotCancel`] signal woven into the `cancel` future the
+    /// transport polls between chunks (and into the backoff `select!`), so a long `full_snapshot`
+    /// does not stall the ring drain indefinitely.
+    async fn drive_snapshot(&mut self, inflight_id: InflightId) {
+        // Capture the epoch AFTER this `Snapshot` op was taken from the ring: a strictly-later
+        // Replicate/Snapshot op (or shutdown) trips the cancel future; this op itself does not.
+        let start_epoch = self.snapshot_cancel.epoch.load(Ordering::Acquire);
+
+        // Backoff policy on `Unreachable`; reset on a non-unreachable RPC error (port of the
+        // reference's `self.backoff`).
+        let mut backoff: Option<Backoff> = None;
+
+        let mut ith: i32 = -1;
+        loop {
+            ith += 1;
+
+            let res = self.read_and_send_snapshot(inflight_id, ith, start_epoch).await;
+
+            let error = match res {
+                Ok(()) => return,
+                Err(error) => error,
+            };
+
+            tracing::error!("ReplicationError while sending snapshot: {}", error);
+
+            let err = match self.ack.on_snapshot_error(error).await {
+                SnapshotErrAction::Stop => return,
+                SnapshotErrAction::Rpc(err) => err,
+            };
+
+            // Port of `stream_snapshot`'s RPCError branch: set/reset backoff, then wait (racing
+            // the cancel signal) before retrying.
+            match &err {
+                RPCError::Unreachable(_unreachable) => {
+                    if backoff.is_none() {
+                        let config = self.config.clone();
+                        let net = self.network.as_ref().expect("network present until executor drop");
+                        backoff = Some(net.backoff().unwrap_or_else(|| config.build_backoff()));
+                    }
+                }
+                RPCError::Timeout(_) | RPCError::Network(_) | RPCError::RemoteError(_) => {
+                    backoff = None;
+                }
+            }
+
+            if let Some(b) = &mut backoff {
+                let duration = b.next().unwrap_or_else(|| {
+                    tracing::warn!("backoff exhausted, using default");
+                    Duration::from_millis(500)
+                });
+
+                let sleep = C::sleep(duration);
+                let cancel = snapshot_cancel_future(self.snapshot_cancel.clone(), start_epoch);
+
+                futures_util::select! {
+                    _ = sleep.fuse() => {
+                        tracing::debug!("snapshot backoff timeout");
+                    }
+                    _ = cancel.fuse() => {
+                        tracing::info!("snapshot transmission canceled during backoff");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Port of `SnapshotTransmitter::read_and_send_snapshot`: fetch the current snapshot from the
+    /// state machine, then send it. A missing snapshot is a fatal storage error (mirrors the
+    /// reference). The `cancel` future is built fresh per attempt so each `full_snapshot` polls a
+    /// live signal.
+    async fn read_and_send_snapshot(
+        &mut self,
+        inflight_id: InflightId,
+        ith: i32,
+        start_epoch: u64,
+    ) -> Result<(), ReplicationError<C>> {
+        let snapshot = self.snapshot_reader.get_snapshot().await.map_err(|reason| {
+            tracing::warn!("failed to get snapshot from state machine: {}", reason);
+            ReplicationClosed::new(reason)
+        })?;
+
+        tracing::info!("{}-th snapshot sending", ith);
+
+        let snapshot = match snapshot {
+            None => {
+                let sto_err = StorageError::read_snapshot(None, C::err_from_string("snapshot not found"));
+                return Err(sto_err.into());
+            }
+            Some(x) => x,
+        };
+
+        let mut option = RPCOption::new(self.config.install_snapshot_timeout());
+        option.snapshot_chunk_size = Some(self.config.snapshot_max_chunk_size as usize);
+
+        let cancel = snapshot_cancel_future(self.snapshot_cancel.clone(), start_epoch);
+
+        // Take the network into a local (see `drive_replicate`) so the `full_snapshot` borrow
+        // does not tie up `self` for the ack emits; restored before returning.
+        let mut network = self.network.take().expect("network present until executor drop");
+        let result = self.ack.send_snapshot(&mut network, snapshot, inflight_id, cancel, option).await;
+        self.network = Some(network);
+        result
+    }
+
     /// Port of `ReplicationCore::new_request_stream`.
     fn new_request_stream(stream_context: StreamContext<C, LS>) -> BoxStream<'static, AppendEntriesRequest<C>> {
         let strm = futures_util::stream::unfold(stream_context, Self::next_append_request);
@@ -782,45 +1089,52 @@ where C: RaftTypeConfig {
 /// executor drives via [`block_on`] finds a driver — the same "hybrid reactor" approach as the
 /// consensus thread. `target` is included in the thread name so peers are distinguishable in
 /// dumps.
-pub(crate) fn spawn_peer<C, N, LS>(
+pub(crate) fn spawn_peer<C, N, LS, SM>(
     rt_handle: tokio::runtime::Handle,
-    executor: PeerExecutor<C, N, LS>,
+    executor: PeerExecutor<C, N, LS, SM>,
     target: &C::NodeId,
 ) -> PeerConsumerHandle<C>
 where
     C: RaftTypeConfig,
-    N: NetStreamAppend<C> + NetBackoff<C>,
+    N: NetStreamAppend<C> + NetBackoff<C> + NetSnapshot<C>,
     LS: RaftLogStorage<C>,
+    SM: 'static,
 {
     let factory = || NetEvent::<C> { op: Mutex::new(None) };
     // Power-of-two ring; 64 slots is generous for burst replication ops per peer.
     let (poller, builder) = build_single_producer(64, factory, BusySpin).new_event_poller();
     let producer = builder.build();
 
+    // Share the snapshot cancel/replace signal between the producer-side handle and the
+    // consumer (clone the Arc out before `executor` is moved onto the thread).
+    let snapshot_cancel = executor.snapshot_cancel();
+
     let join = std::thread::Builder::new()
         .name(format!("openraft-sync-net-peer-{}", target))
         .spawn(move || {
             // Enter the tokio runtime context so the executor's quinn I/O finds a driver.
             let _enter = rt_handle.enter();
-            consumer_loop::<C, N, LS>(executor, poller);
+            consumer_loop::<C, N, LS, SM>(executor, poller);
         })
         .expect("failed to spawn peer network consumer thread");
 
     PeerConsumerHandle {
         producer: Some(producer),
         join: Some(join),
+        snapshot_cancel,
     }
 }
 
 /// The reactor-free per-peer consumer loop. Drains the send ring, drives ops, then re-drives
 /// the streaming tail only when the anti-spam gate allows. Exits on `Polling::Shutdown`.
-fn consumer_loop<C, N, LS>(
-    mut executor: PeerExecutor<C, N, LS>,
+fn consumer_loop<C, N, LS, SM>(
+    mut executor: PeerExecutor<C, N, LS, SM>,
     mut poller: EventPoller<NetEvent<C>, SingleProducerBarrier>,
 ) where
     C: RaftTypeConfig,
-    N: NetStreamAppend<C> + NetBackoff<C>,
+    N: NetStreamAppend<C> + NetBackoff<C> + NetSnapshot<C>,
     LS: RaftLogStorage<C>,
+    SM: 'static,
 {
     loop {
         let mut did_work = false;
@@ -1163,5 +1477,141 @@ mod tests {
         let notis = drain(&mut rx);
         assert_eq!(notis.len(), 1, "only HigherVote, got {:?}", names(&notis));
         assert!(matches!(notis[0], Notification::HigherVote { .. }));
+    }
+
+    // ---- Snapshot ack-contract tests (Task 3) --------------------------------------------
+    //
+    // These pin the snapshot-send emit contract ported from `SnapshotTransmitter`
+    // (`send_snapshot` + `stream_snapshot`'s terminal error match):
+    //  - success → `HeartbeatProgress` then `ReplicationProgress{Ok(Ok(meta.last_log_id)),
+    //    inflight_id = Some(id)}`;
+    //  - a higher vote in the response → `HigherVote`, no progress;
+    //  - a storage error → `StorageError` (fatal), no progress.
+    // They exercise the same `AckEmitter::send_snapshot` / `on_snapshot_error` methods the
+    // peer executor's `drive_snapshot` drives, with a stubbed `NetSnapshot::full_snapshot`.
+
+    use std::future::Future;
+    use std::time::Duration;
+
+    use super::SnapshotErrAction;
+    use crate::StorageError;
+    use crate::base::OptionalSend;
+    use crate::errors::ReplicationClosed;
+    use crate::errors::StreamingError;
+    use crate::network::NetSnapshot;
+    use crate::network::RPCOption;
+    use crate::raft::SnapshotResponse;
+    use crate::storage::Snapshot;
+    use crate::storage::SnapshotMeta;
+    use crate::type_config::alias::SnapshotOf;
+    use crate::type_config::alias::VoteOf;
+
+    /// A stub `NetSnapshot` whose `full_snapshot` returns one canned response.
+    struct StubSnapNet {
+        resp: Option<Result<SnapshotResponse<TC>, StreamingError<TC>>>,
+    }
+
+    impl NetSnapshot<TC> for StubSnapNet {
+        async fn full_snapshot(
+            &mut self,
+            _vote: VoteOf<TC>,
+            _snapshot: SnapshotOf<TC>,
+            _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+            _option: RPCOption,
+        ) -> Result<SnapshotResponse<TC>, StreamingError<TC>> {
+            self.resp.take().expect("full_snapshot called once")
+        }
+    }
+
+    /// Build a snapshot whose meta carries `last_log_id`.
+    fn snapshot_with(last: Option<LogIdOf<TC>>) -> SnapshotOf<TC> {
+        let meta = SnapshotMeta {
+            last_log_id: last,
+            last_membership: Default::default(),
+            snapshot_id: "snap-1".to_string(),
+        };
+        Snapshot {
+            meta,
+            snapshot: std::io::Cursor::new(vec![]),
+        }
+    }
+
+    /// A cancel future that never fires (the stub returns synchronously).
+    fn never_cancel() -> impl Future<Output = ReplicationClosed> + OptionalSend + 'static {
+        futures_util::future::pending()
+    }
+
+    /// (snapshot-a) Success → `HeartbeatProgress` then `ReplicationProgress` with
+    /// `Ok(Ok(meta.last_log_id))` and `inflight_id = Some(id)`.
+    #[test]
+    fn ack_contract_snapshot_success() {
+        let (mut ack, mut rx) = new_emitter();
+        let id = InflightId::new(7);
+        let last = Some(log_id(1, 2, 5));
+
+        // Response vote equals the sender vote (no higher vote) → success.
+        let mut net = StubSnapNet {
+            resp: Some(Ok(SnapshotResponse::new(Vote::new(1, 2)))),
+        };
+        let opt = RPCOption::new(Duration::from_millis(1000));
+        let res = block_on(ack.send_snapshot(&mut net, snapshot_with(last.clone()), id, never_cancel(), opt));
+        assert!(res.is_ok(), "snapshot sent successfully");
+
+        let notis = drain(&mut rx);
+        assert_eq!(notis.len(), 2, "expected HeartbeatProgress + ReplicationProgress, got {:?}", names(&notis));
+        assert!(matches!(notis[0], Notification::HeartbeatProgress { .. }), "first: {}", notis[0]);
+        match &notis[1] {
+            Notification::ReplicationProgress { progress, inflight_id } => {
+                assert_eq!(*inflight_id, Some(id), "snapshot progress carries the inflight id");
+                let result = progress.result.as_ref().expect("Ok progress");
+                assert_eq!(result.0, Ok(last), "snapshot match == meta.last_log_id");
+            }
+            other => panic!("expected ReplicationProgress, got {}", other),
+        }
+    }
+
+    /// (snapshot-b) A higher vote in the response → `send_snapshot` returns
+    /// `Err(HigherVote)`, and `on_snapshot_error` emits `HigherVote` (no progress).
+    #[test]
+    fn ack_contract_snapshot_higher_vote() {
+        let (mut ack, mut rx) = new_emitter();
+        let id = InflightId::new(7);
+
+        let mut net = StubSnapNet {
+            resp: Some(Ok(SnapshotResponse::new(Vote::new(5, 9)))),
+        };
+        let opt = RPCOption::new(Duration::from_millis(1000));
+        let res = block_on(ack.send_snapshot(&mut net, snapshot_with(Some(log_id(1, 2, 5))), id, never_cancel(), opt));
+        let err = res.expect_err("higher vote → error");
+
+        let action = block_on(ack.on_snapshot_error(err));
+        assert!(matches!(action, SnapshotErrAction::Stop), "higher vote stops the snapshot loop");
+
+        let notis = drain(&mut rx);
+        assert_eq!(notis.len(), 1, "only HigherVote, got {:?}", names(&notis));
+        assert!(matches!(notis[0], Notification::HigherVote { .. }), "got {}", notis[0]);
+    }
+
+    /// (snapshot-c) A storage error from `full_snapshot` → `send_snapshot` propagates it and
+    /// `on_snapshot_error` emits `StorageError` (fatal, no progress).
+    #[test]
+    fn ack_contract_snapshot_storage_error() {
+        let (mut ack, mut rx) = new_emitter();
+        let id = InflightId::new(7);
+
+        let sto_err = StorageError::<TC>::read_snapshot(None, TC::err_from_string("snap fail"));
+        let mut net = StubSnapNet {
+            resp: Some(Err(StreamingError::StorageError(sto_err))),
+        };
+        let opt = RPCOption::new(Duration::from_millis(1000));
+        let res = block_on(ack.send_snapshot(&mut net, snapshot_with(Some(log_id(1, 2, 5))), id, never_cancel(), opt));
+        let err = res.expect_err("storage error → error");
+
+        let action = block_on(ack.on_snapshot_error(err));
+        assert!(matches!(action, SnapshotErrAction::Stop), "storage error stops the snapshot loop");
+
+        let notis = drain(&mut rx);
+        assert_eq!(notis.len(), 1, "only StorageError, got {:?}", names(&notis));
+        assert!(matches!(notis[0], Notification::StorageError { .. }), "got {}", notis[0]);
     }
 }

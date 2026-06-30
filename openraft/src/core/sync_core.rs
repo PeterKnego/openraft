@@ -37,16 +37,15 @@
 //! `AppendEntries`, `SaveVote`, `PurgeLog`, `TruncateLog`, `UpdateIOProgress`,
 //! `ReplicateCommitted`, `Respond`, `SaveCommittedAndApply`, `StateMachine`.
 //!
-//! Still delegated to `RaftCore`: the 8 task-spawning / network commands
-//! (`SendVote`, `SendPreVote`, `BroadcastHeartbeat`, `Replicate`,
-//! `ReplicateSnapshot`, `BroadcastTransferLeader`, `CloseReplicationStreams`,
-//! `RebuildReplicationStreams`) and the two engine-driving per-message handlers
-//! (`handle_api_msg`, `handle_notification`). Phase 3c relocates these.
+//! Replication / heartbeat / snapshot run on the per-peer network consumers
+//! (`Replicate`, `BroadcastHeartbeat`, `ReplicateSnapshot`, `RebuildReplicationStreams`,
+//! `CloseReplicationStreams`). Still delegated to `RaftCore`: the vote / transfer-leader
+//! commands (`SendVote`, `SendPreVote`, `BroadcastTransferLeader`) and the two engine-driving
+//! per-message handlers (`handle_api_msg`, `handle_notification`). Task 4 relocates these.
 //!
 //! Validated by running openraft's own integration suite with
 //! `--features sync-core`.
 
-use std::collections::BTreeMap;
 
 use crate::async_runtime::MpscReceiver;
 use crate::async_runtime::TryRecvError;
@@ -70,8 +69,6 @@ use crate::core::stage::Stage;
 use crate::engine::Command;
 use crate::engine::replication_progress::TargetProgress;
 use crate::replication::ReplicationSessionId;
-use crate::replication::replicate::Replicate;
-use crate::replication::replication_handle::ReplicationHandle;
 use crate::type_config::alias::CommittedVoteOf;
 use crate::entry::RaftEntry;
 use crate::errors::ClientWriteError;
@@ -348,10 +345,7 @@ where
         // scrutinee borrow is still live, which does not compile.
         let delegate = matches!(
             &cmd,
-            Command::SendVote { .. }
-                | Command::SendPreVote { .. }
-                | Command::ReplicateSnapshot { .. }
-                | Command::BroadcastTransferLeader { .. }
+            Command::SendVote { .. } | Command::SendPreVote { .. } | Command::BroadcastTransferLeader { .. }
         );
         if delegate {
             return self.core.run_command(cmd).await;
@@ -498,6 +492,18 @@ where
                     tracing::warn!("Replicate to target {} with no peer consumer; dropping op", target);
                 }
             }
+            Command::ReplicateSnapshot { target, inflight_id, .. } => {
+                // Port of `RaftCore::ReplicateSnapshot`: hand the snapshot send to the target's
+                // peer consumer (which owns the snapshot reader + cancel/replace). The executor
+                // uses its own `leader_vote` (set at spawn), which equals the command's.
+                if let Some(peer) = self.peers.get_mut(&target) {
+                    peer.publish(NetOp::Snapshot { inflight_id });
+                } else {
+                    // Like `Replicate`: a missing peer means a teardown race — drop the op (the
+                    // engine re-drives after the next Rebuild).
+                    tracing::warn!("ReplicateSnapshot to target {} with no peer consumer; dropping op", target);
+                }
+            }
             Command::BroadcastHeartbeat { session_id } => {
                 // Port of `RaftCore::broadcast_heartbeat`: validate the session, compute each
                 // peer's `HeartbeatEvent`, then publish one `NetOp::Heartbeat` per peer consumer.
@@ -540,12 +546,9 @@ where
             }
             Command::CloseReplicationStreams => {
                 // Drop every peer consumer handle → producers drop → consumer threads exit.
-                // (The heartbeat workers are folded into the same consumers, so no separate close.)
+                // (Heartbeat AND snapshot are folded into the same consumers; dropping a handle
+                // sets its `SnapshotCancel::shutdown`, aborting any in-flight snapshot.)
                 self.peers.clear();
-                // Keep the parallel `RaftCore.replications` map (used only by the still-delegated
-                // `ReplicateSnapshot` path) in sync; dropping its handles cancels any in-flight
-                // snapshot transmitters, matching `RaftCore::CloseReplicationStreams`.
-                self.core.replications.clear();
             }
             Command::RebuildReplicationStreams {
                 leader_vote,
@@ -554,21 +557,16 @@ where
             } => {
                 // Build the new peer set, reusing existing consumers when membership-only change
                 // (close_old_streams == false). Mirrors `RaftCore`'s replication-table rebuild.
+                // Each consumer owns its own snapshot path (reader + cancel/replace), so there is
+                // no longer a parallel `RaftCore.replications` map to maintain.
                 let mut new_peers: PeerTable<C> = PeerTable::new();
-                // Maintained in parallel: a minimal `RaftCore.replications` entry per target,
-                // carrying `stream_id` + the snapshot-transmitter slot, so the still-delegated
-                // `ReplicateSnapshot` command (which reads `self.replications`) keeps working now
-                // that replication itself lives on the per-peer consumers. The dummy
-                // replicate/cancel channels are never used (the consumers do the replicating);
-                // only `stream_id` and `snapshot_transmit_handle` matter. Snapshot relocates to
-                // the peer executor in a later task.
-                let mut new_replications = BTreeMap::new();
 
                 for prog in targets.iter() {
                     let reused = match self.peers.remove(&prog.target) {
                         Some(existing) if !close_old_streams => Some(existing),
                         Some(existing) => {
-                            // Vote changed: close the old consumer (drop detaches its thread).
+                            // Vote changed: close the old consumer (drop detaches its thread and
+                            // aborts any in-flight snapshot via `SnapshotCancel::shutdown`).
                             drop(existing);
                             None
                         }
@@ -581,24 +579,11 @@ where
                     };
 
                     new_peers.insert(prog.target.clone(), handle);
-
-                    // Parallel replication-handle bookkeeping (reuse preserves an in-flight
-                    // snapshot transmitter; close_old / new creates a fresh minimal handle).
-                    let repl = match self.core.replications.remove(&prog.target) {
-                        Some(existing) if !close_old_streams => existing,
-                        _ => {
-                            let (replicate_tx, _replicate_rx) = C::watch_channel(Replicate::default());
-                            let (cancel_tx, _cancel_rx) = C::watch_channel(());
-                            ReplicationHandle::new(prog.progress.stream_id, replicate_tx, cancel_tx)
-                        }
-                    };
-                    new_replications.insert(prog.target.clone(), repl);
                 }
 
-                // Targets no longer present are dropped (peer consumers detach; snapshot
-                // transmitters cancel) when the old maps are replaced.
+                // Targets no longer present are dropped (their peer consumers detach and abort any
+                // in-flight snapshot) when the old peer table is replaced.
                 self.peers = new_peers;
-                self.core.replications = new_replications;
             }
 
             // All owned commands are explicit above; the remaining task-spawning commands
@@ -631,9 +616,14 @@ where
             rx.await.expect("log-store consumer vends a reader")
         };
 
+        // Snapshot reader (handle to the sm worker) for this peer's snapshot path — the
+        // equivalent of `RaftCore::ReplicateSnapshot`'s `self.sm_handle.new_snapshot_reader()`,
+        // created once per peer consumer and reused for each `NetOp::Snapshot`.
+        let snapshot_reader = self.core.sm_handle.new_snapshot_reader();
+
         // `LS` cannot be inferred through the `VendedReader<C, LS>` associated-type projection,
         // so name the executor type explicitly.
-        let executor = PeerExecutor::<C, NF::Network, LS>::new(
+        let executor = PeerExecutor::<C, NF::Network, LS, SM>::new(
             self.core.id.clone(),
             prog.target.clone(),
             leader_vote,
@@ -647,6 +637,7 @@ where
             self.core.io_submitted_tx.subscribe(),
             self.core.shared_replicate_batch.clone(),
             prog.progress.matching.clone(),
+            snapshot_reader,
         );
 
         let rt_handle = tokio::runtime::Handle::current();
