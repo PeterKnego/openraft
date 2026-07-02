@@ -676,6 +676,14 @@ impl TypedRaftRouter {
         Ok(())
     }
 
+    /// Make a node's `limited_get_log_entries` return empty for reads starting below `index`,
+    /// simulating a purged prefix under a live replication stream. `0` disables.
+    pub fn set_empty_limited_get_below(&self, node_id: &MemNodeId, index: u64) -> anyhow::Result<()> {
+        let (log_store, _) = self.get_storage_handle(node_id)?;
+        log_store.set_empty_limited_get_below(index);
+        Ok(())
+    }
+
     pub fn wait(&self, node_id: &MemNodeId, timeout: Option<Duration>) -> Wait<MemConfig> {
         let node = {
             let rt = self.nodes.lock().unwrap();

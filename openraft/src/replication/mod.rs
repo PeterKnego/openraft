@@ -151,6 +151,9 @@ where
                 inflight_id: None,
                 leader_committed: None,
                 backoff_consumer: backoff_state.consumer(),
+                empty_read_count: 0,
+                escalated_inflight: None,
+                end_session_unservable: false,
             })),
             inflight_id: None,
             event_watcher,
@@ -258,6 +261,9 @@ where
                 let mut stream_state = self.stream_state.lock().await;
                 stream_state.payload = Some(payload.clone());
                 stream_state.inflight_id = self.inflight_id;
+                // Fresh payload = fresh read attempt; the escalation once-guard stays keyed
+                // to the inflight id so re-installing the same payload can't re-escalate.
+                stream_state.empty_read_count = 0;
                 stream_state.leader_committed = self.event_watcher.committed_rx.borrow_watched().clone()
             }
 

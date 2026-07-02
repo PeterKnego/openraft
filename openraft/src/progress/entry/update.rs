@@ -111,13 +111,20 @@ where C: RaftTypeConfig
             matching.display()
         );
 
+        // A response is authoritative only if it belongs to the CURRENT inflight request.
+        // Heartbeat responses (`inflight_id == None`) and responses from a superseded stream
+        // (stale id: the inflight was since reset/re-issued, e.g. after a replication error
+        // or an unservable-range escalation) must not regress `matching` — the follower's
+        // state they report may be older than what a newer request already acknowledged.
+        let is_current = inflight_id.is_some() && inflight_id == self.entry.inflight.inflight_id();
+
         if let Some(inflight_id) = inflight_id {
             self.entry.inflight.ack(matching.clone(), inflight_id);
         }
 
-        // If it is not a response of an actual replication(such as replicating commit log id),
-        // it may not indicate an actual progress.
-        if inflight_id.is_none() && matching <= self.entry.matching {
+        // If it is not a response of the current in-flight replication (a heartbeat, or a
+        // stale stream's response), it may not indicate an actual progress.
+        if !is_current && matching <= self.entry.matching {
             return;
         }
 

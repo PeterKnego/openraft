@@ -673,6 +673,9 @@ where
             inflight_id: None,
             leader_committed: None,
             backoff_consumer: backoff_state.consumer(),
+            empty_read_count: 0,
+            escalated_inflight: None,
+            end_session_unservable: false,
         }));
 
         let ack = AckEmitter {
@@ -802,6 +805,8 @@ where
             stream_state.payload = Some(payload_local.clone());
             stream_state.inflight_id = self.ack.inflight_id;
             stream_state.leader_committed = committed.clone();
+            // Fresh payload = fresh read attempt (see ReplicationCore::main).
+            stream_state.empty_read_count = 0;
         }
 
         let inflight_queue = InflightAppendQueue::new();

@@ -179,6 +179,12 @@ pub struct MemLogStore {
 
     /// When set to true, the next `limited_get_log_entries` call will return an IO error.
     pub fail_next_limited_get: AtomicBool,
+
+    /// When non-zero, `limited_get_log_entries` returns an empty result for any read whose
+    /// `start` is below this index — simulating a store whose prefix has been purged out from
+    /// under a replication stream (reads below the purge horizon return nothing, while reads
+    /// at or above it are served normally). `0` disables the behavior.
+    pub empty_limited_get_below: AtomicU64,
 }
 
 impl MemLogStore {
@@ -194,6 +200,7 @@ impl MemLogStore {
             vote: RwLock::new(None),
             return_empty_limited_get: AtomicBool::new(false),
             fail_next_limited_get: AtomicBool::new(false),
+            empty_limited_get_below: AtomicU64::new(0),
         }
     }
 
@@ -206,6 +213,12 @@ impl MemLogStore {
     /// Make the next `limited_get_log_entries` call fail with an IO error.
     pub fn set_fail_next_limited_get(&self, value: bool) {
         self.fail_next_limited_get.store(value, Ordering::Relaxed);
+    }
+
+    /// Make `limited_get_log_entries` return empty for reads starting below `index`
+    /// (simulated purge horizon; see `empty_limited_get_below`). `0` disables.
+    pub fn set_empty_limited_get_below(&self, index: u64) {
+        self.empty_limited_get_below.store(index, Ordering::Relaxed);
     }
 }
 
@@ -317,6 +330,17 @@ impl RaftLogReader<TypeConfig> for Arc<MemLogStore> {
                 "limited_get_log_entries({}, {}): returning empty for testing",
                 start,
                 end
+            );
+            return Ok(vec![]);
+        }
+
+        let below = self.empty_limited_get_below.load(Ordering::Relaxed);
+        if below > 0 && start < below {
+            tracing::info!(
+                "limited_get_log_entries({}, {}): start below simulated purge horizon {}; returning empty for testing",
+                start,
+                end,
+                below
             );
             return Ok(vec![]);
         }

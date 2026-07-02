@@ -6,6 +6,7 @@ mod fixtures;
 
 mod t10_append_entries_partial_success;
 mod t20_empty_log_entries;
+mod t21_empty_reads_escalate_to_snapshot;
 mod t50_append_entries_backoff;
 mod t50_append_entries_backoff_rejoin;
 mod t51_backoff_cleared_after_success;

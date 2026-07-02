@@ -22,6 +22,7 @@ use crate::replication::backoff_consumer::BackoffConsumer;
 use crate::replication::event_watcher::EventWatcher;
 use crate::replication::payload::Payload;
 use crate::replication::replication_context::ReplicationContext;
+use crate::replication::response::Progress;
 use crate::storage::RaftLogStorage;
 use crate::type_config::TypeConfigExt;
 use crate::type_config::alias::EntryOf;
@@ -60,7 +61,40 @@ where
     /// The consumer can only query the next delay; only `ReplicationCore` (via its
     /// owned `BackoffState`) enables or clears the backoff.
     pub(crate) backoff_consumer: BackoffConsumer,
+
+    /// Consecutive empty `limited_get_log_entries` results for the current payload.
+    ///
+    /// A bounded number of empty reads is tolerated as transient (e.g. a read racing an
+    /// append's visibility). Past the bound the range is considered unservable — typically
+    /// the prefix was purged under a live stream — and the stream escalates to RaftCore so
+    /// the engine can reset the inflight and re-decide (snapshot replication when the
+    /// target's range is below the purge horizon). Reset when a read succeeds or a new
+    /// payload is installed.
+    pub(crate) empty_read_count: u32,
+
+    /// The inflight id for which an unservable-range escalation has already been sent.
+    ///
+    /// Ensures exactly one `Err` progress notification per payload, so repeated empty reads
+    /// while awaiting the engine's re-decision don't thrash the engine's inflight state.
+    pub(crate) escalated_inflight: Option<InflightId>,
+
+    /// Set when the current range proved unservable (escalated empty reads): the stream
+    /// session must end after the pending heartbeat, returning control to the session loop
+    /// so a replacement payload from the engine (e.g. post-snapshot) can be picked up.
+    /// In pipeline mode the generator otherwise never re-checks the replicate channel while
+    /// readable data appears to be ahead.
+    pub(crate) end_session_unservable: bool,
 }
+
+/// Consecutive empty reads tolerated as transient before escalating to RaftCore.
+const MAX_EMPTY_READ_RETRIES: u32 = 10;
+
+/// Sleep between empty-read retries before escalation (transient-glitch grace).
+const EMPTY_READ_RETRY_SLEEP: Duration = Duration::from_millis(10);
+
+/// Sleep between reads after escalation, while waiting for the engine to replace the
+/// payload (e.g. with a snapshot decision). Longer, to avoid hammering storage and logs.
+const ESCALATED_READ_SLEEP: Duration = Duration::from_millis(100);
 
 impl<C, LS> StreamState<C, LS>
 where
@@ -72,6 +106,14 @@ where
     /// Returns `Ok(None)` when there are no more entries to send.
     /// After each call, `log_id_range` is updated to exclude the sent entries.
     pub(crate) async fn next_request(&mut self) -> Result<Option<AppendEntriesRequest<C>>, ReplicationClosed> {
+        // The current range proved unservable (escalated empty reads): end this session so
+        // the session loop can pick up a replacement payload from the engine. The heartbeat
+        // for the unservable attempt was already emitted by the previous call.
+        if self.end_session_unservable {
+            self.end_session_unservable = false;
+            return Ok(None);
+        }
+
         // An empty range still sends one RPC and is then cleared by `update_log_id_range()`.
         let Some(log_id_range) = self.get_log_id_range().await else {
             return Ok(None);
@@ -265,23 +307,17 @@ where
             // limited_get_log_entries will return logs smaller than the range [start, end).
             let logs = self.log_reader.limited_get_log_entries(start, end).await.sto_read_logs()?;
 
-            // Handle empty result gracefully: treat as heartbeat.
-            // This violates the API contract but we don't panic.
-            // We sleep briefly to avoid a tight loop since the log_id_range won't advance.
+            // Handle empty result gracefully: treat as heartbeat, tolerating a bounded
+            // number of transient empties; past the bound, escalate to RaftCore (the range
+            // is unservable — e.g. purged under this live stream) so the engine can reset
+            // the inflight and re-decide, typically switching to snapshot replication.
             if logs.is_empty() {
-                let sleep_duration = Duration::from_millis(10);
-                tracing::warn!(
-                    "limited_get_log_entries({}, {}) returned empty; \
-                     this violates the API contract but is handled gracefully as a heartbeat. \
-                     Sleeping {:?} to avoid tight loop.",
-                    start,
-                    end,
-                    sleep_duration
-                );
-                C::sleep(sleep_duration).await;
+                self.handle_empty_read(start, end).await;
                 let r = LogIdRange::new(rng.prev.clone(), rng.prev.clone());
                 return Ok((vec![], r));
             }
+
+            self.empty_read_count = 0;
 
             let first = logs.first().map(|ent| ent.ref_log_id()).unwrap();
             let last = logs.last().map(|ent| ent.log_id()).unwrap();
@@ -299,6 +335,74 @@ where
             let r = LogIdRange::new(rng.prev.clone(), Some(last));
             Ok((logs, r))
         }
+    }
+
+    /// Handle an empty `limited_get_log_entries` result for a non-empty range.
+    ///
+    /// A bounded number of consecutive empties is tolerated as transient (a read racing an
+    /// append's visibility). Past [`MAX_EMPTY_READ_RETRIES`] the range is considered
+    /// unservable — typically the log prefix was purged under this live stream — and the
+    /// stream escalates to RaftCore with an `Err` replication progress (once per inflight
+    /// id): the engine resets the target's inflight, which unblocks postponed purges and
+    /// lets `next_send` re-decide, choosing snapshot replication when the target's range is
+    /// below the purge horizon.
+    ///
+    /// Without escalation such a stream retries forever while its healthy heartbeat ACKs
+    /// keep the leader content: the target never advances, `try_purge_log` postpones
+    /// purging indefinitely, and the failure is silent (observed as a cluster-wide wedge
+    /// under load once a second target degrades).
+    async fn handle_empty_read(&mut self, start: u64, end: u64) {
+        self.empty_read_count = self.empty_read_count.saturating_add(1);
+
+        if self.empty_read_count < MAX_EMPTY_READ_RETRIES {
+            tracing::debug!(
+                "limited_get_log_entries({}, {}) returned empty ({} consecutive); \
+                 treated as heartbeat, sleeping {:?} before retry",
+                start,
+                end,
+                self.empty_read_count,
+                EMPTY_READ_RETRY_SLEEP
+            );
+            C::sleep(EMPTY_READ_RETRY_SLEEP).await;
+            return;
+        }
+
+        // Unservable: after the heartbeat for this attempt is sent, end the session so the
+        // session loop can pick up the engine's replacement payload.
+        self.end_session_unservable = true;
+
+        let inflight_id = self.inflight_id;
+        if inflight_id.is_some() && self.escalated_inflight != inflight_id {
+            self.escalated_inflight = inflight_id;
+            tracing::warn!(
+                "limited_get_log_entries({}, {}) returned empty {} consecutive times; \
+                 range is unservable (purged under this stream?); escalating to RaftCore \
+                 to re-decide replication for target={}",
+                start,
+                end,
+                self.empty_read_count,
+                self.replication_context.target
+            );
+            self.replication_context
+                .tx_notify
+                .send(Notification::ReplicationProgress {
+                    progress: Progress {
+                        target: self.replication_context.target.clone(),
+                        result: Err(format!(
+                            "replication log read returned empty for range [{}, {}): \
+                             range unservable (purged?)",
+                            start, end
+                        )),
+                    },
+                    inflight_id,
+                })
+                .await
+                .ok();
+        }
+
+        // Park between reads while awaiting the engine's re-decision (the payload is
+        // replaced via the replicate channel when it arrives).
+        C::sleep(ESCALATED_READ_SLEEP).await;
     }
 }
 

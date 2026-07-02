@@ -136,6 +136,16 @@ where C: RaftTypeConfig
         &Inflight::None == self
     }
 
+    /// The id of the current inflight request, if any.
+    pub(crate) fn inflight_id(&self) -> Option<InflightId> {
+        match self {
+            Inflight::None => None,
+            Inflight::Logs { inflight_id, .. } => Some(*inflight_id),
+            Inflight::Snapshot { inflight_id } => Some(*inflight_id),
+            Inflight::LogsSince { inflight_id, .. } => Some(*inflight_id),
+        }
+    }
+
     // test it if used
     #[allow(dead_code)]
     pub(crate) fn is_sending_log(&self) -> bool {
@@ -159,7 +169,10 @@ where C: RaftTypeConfig
     pub(crate) fn ack(&mut self, upto: Option<LogIdOf<C>>, from_inflight_id: InflightId) {
         match self {
             Inflight::None => {
-                unreachable!("no inflight data")
+                // A response can legitimately arrive after the inflight was reset (e.g. a
+                // replication error or an unservable-range escalation cleared it while a
+                // late ack from the old stream was still in transit). Ignore it as stale.
+                tracing::debug!("ack from inflight_id={} ignored: no inflight data", from_inflight_id);
             }
             Inflight::Logs {
                 log_id_range,
